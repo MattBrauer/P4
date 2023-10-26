@@ -61,9 +61,10 @@ bb <- connect(
 ah <- AnnotationHub::AnnotationHub()
 edb <- ah[["AH109606"]]
 ```
-This chunk build the data frame `allele_rarity`, which contains filtered
+This chunk builds the data frames `allele_rarity`, which contains filtered
 variants from the 200K WES namespace, their COAST weights, and columns with
-minor allele count and frequence
+minor allele count and frequence, and `test_variants`, which is a subset of 7
+genes' variants for passing to MVL.
 
 ```{r build-data-set}
 
@@ -101,11 +102,6 @@ compute_gene_aaf <- function(args, list_label, g) {
   aac <- apply(g, 2, sum, na.rm=TRUE)
   return(list(aaf=aaf, aac=aac))
 }
-
-# biallelic_lists <- biallelic %>%
-#   dplyr::mutate(group = row_number) %>%
-#   group_by(list_label) %>%
-#   group_split()
 
 result <- bb$map_variant_lists(namespace = 'UKB_200K_WES',
                                args = list(),
