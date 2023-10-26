@@ -1,0 +1,223 @@
+---
+title: "Burst-mode reprex"
+author: "Matt Brauer"
+date: "2023-10-24"
+output: html_document
+---
+
+
+## Set up environment
+
+```{r knitr, eval=TRUE, include=FALSE, echo=FALSE, message=FALSE, warning=FALSE ,error=FALSE}
+# Default chunk options. See https://www.rstudio.com/wp-content/uploads/2015/03/rmarkdown-reference.pdf
+knitr::opts_chunk$set(eval=TRUE,                  # evaluate all chunks
+                      include=FALSE,              # run chunk but do not include code or output
+                      echo=FALSE,                 # suppress echo of code above output
+                      results='hide',             # do not include results (default 'markup')
+                      message=FALSE,              # suppress messages
+                      warning=FALSE,              # suppress warnings
+                      error=FALSE,                # FALSE --> stop on error
+                      fig.width=12, fig.height=8) # set global figure size
+```
+
+
+```{r install-packages, eval=TRUE}
+# Install and load project-specific packages
+
+packages <- c("BiocManager",
+              "tidyverse",
+              "biobank",
+              "AnnotationHub")
+BiocPackages <- c("GenomicRanges")
+ScidbPackages <- c("scidb", "arrayop", "BurstMode", "biobank")
+repos = c("https://cran.rstudio.com/", "http://scidb.mazetx.com/p4_r_repo/")
+
+installed_packages <- packages %in% rownames(installed.packages())
+
+if (any(installed_packages == FALSE)) {
+  install.packages(packages[!installed_packages])
+}
+installed_packages <- BiocPackages %in% rownames(installed.packages())
+if (any(installed_packages == FALSE)) {
+  BiocManager::install(BiocPackages)
+}
+
+invisible(lapply(c(packages, BiocPackages), library, character.only = TRUE))
+
+base_dir <- here::here()
+```
+
+
+```{r scidb-connect}
+bb <- connect(
+  host = "scidb.mazetx.com",
+  username = "mbrauer", #replace with your username
+  password = rstudioapi::askForPassword(), #this is your Okta password
+  port = 8083,
+  protocol = "https")
+```
+
+```{r annotation-sources}
+ah <- AnnotationHub::AnnotationHub()
+edb <- ah[["AH109606"]]
+```
+This chunk build the data frame `allele_rarity`, which contains filtered
+variants from the 200K WES namespace, their COAST weights, and columns with
+minor allele count and frequence
+
+```{r build-data-set}
+
+vars_df <- bb$get_variants(namespace='UKB_200K_WES')
+coast_df <- bb$get_annotation_frame("public",
+                                    "WES_200K_COAST_annos",
+                                    variant_list = vars_df) %>%
+  tibble::as_tibble() %>%
+  dplyr::rename(weight = coast_anno)
+
+annotations <- transcripts(edb, filter = TxIdFilter(coast_df$list_label))
+canonical_transcripts <- coast_df %>%
+  dplyr::rename(tx_id = list_label) %>%
+  dplyr::left_join(mcols(annotations),
+                   by = "tx_id",
+                   copy=TRUE) %>%
+  tidyr::separate_wider_delim(tx_external_name, delim='-',
+                              names=c("symbol","isoform"), too_many="drop") %>%
+  dplyr::filter(tx_is_canonical == 1, !is.na(symbol)) %>%
+  dplyr::rename(list_label = symbol) %>%
+  dplyr::select(list_label, chrom:weight)
+# > nrow(canonical_transcripts)
+# [1] 4458566
+canonical_transcripts %>% saveRDS(fs::path(base_dir, "output", "canonical_transcripts", ext = "rds"))
+
+biallelic <- canonical_transcripts %>%
+  dplyr::left_join(canonical_transcripts %>% dplyr::summarize(alleles=n(), .by=c("chrom","pos")),
+                   by=c("chrom"="chrom","pos"="pos")) %>%
+  dplyr::mutate(alleles = alleles + 1) %>%
+  dplyr::filter(alleles==2) %>%
+  dplyr::select(-alleles)
+
+compute_gene_aaf <- function(args, list_label, g) {
+  aaf <- colMeans(g, na.rm=TRUE)/2
+  aac <- apply(g, 2, sum, na.rm=TRUE)
+  return(list(aaf=aaf, aac=aac))
+}
+
+# biallelic_lists <- biallelic %>%
+#   dplyr::mutate(group = row_number) %>%
+#   group_by(list_label) %>%
+#   group_split()
+
+result <- bb$map_variant_lists(namespace = 'UKB_200K_WES',
+                               args = list(),
+                               variant_lists = biallelic,
+                               func = compute_gene_aaf,
+                               genotype_format = 'dose_matrix')
+
+res <- lapply(result, function(gene) {
+  lapply(gene, function(r) r %>% tibble::enframe()) %>%
+    dplyr::bind_rows(.id="stat") %>%
+    dplyr::select(name, stat, value) %>%
+    dplyr::rename(variant=name) %>%
+    tidyr::pivot_wider(names_from=stat, values_from=value)
+}) %>%
+  dplyr::bind_rows(.id = "symbol") %>%
+  tidyr::separate_wider_delim(variant,
+                              delim = ":",
+                              names = c("chrom","pos","ref","alt"),
+                              cols_remove = FALSE) %>%
+  dplyr::select(variant, symbol, chrom, pos, ref, alt, aaf, aac) %>%
+  dplyr::mutate(chrom = as.numeric(chrom),
+                pos = as.numeric(pos))
+
+allele_rarity <- res %>%
+  dplyr::left_join(biallelic, by=c("chrom","pos","ref","alt")) %>%
+  dplyr::mutate(rare = (aaf <= 0.01),
+                ultra_rare = (aac <= 10)) %>%
+  dplyr::select(variant, chrom, pos, ref, alt, aaf, aac, rare, ultra_rare)
+# > dim(allele_rarity)
+# [1] 5309    6
+
+
+test_variants <- allele_rarity %>%
+  dplyr::filter(list_label %in% c("A4GALT","A4GNT","APOL1","SLC6A19","MIOX","LRP2","PKD1")) %>%
+  dplyr::select(list_label, chrom, pos, ref, alt, weight)
+# > dim(test_variants)
+# [1] 5309    6
+
+allele_rarity %>% saveRDS(fs::path(base_dir, "allele_rarity_reprex", ext="rds"))
+test_variants %>% saveRDS(fs::path(base_dir, "test_variants_reprex", ext="rds"))
+
+```
+
+
+
+```{r simple-burst-mode-test}
+
+allele_rarity <- readRDS(fs::path(base_dir, "allele_rarity_reprex", ext="rds"))
+test_variants <- readRDS(fs::path(base_dir, "test_variants_reprex", ext="rds"))
+
+burst_mode_test <- function(args, list_label, genotypes, variant_list) {
+  
+  if (anyNA(genotypes)) {
+    warning("Omitting NA genotypes")
+    genotypes <- na.omit(genotypes)
+    geno_eids <- as.numeric(rownames(genotypes))
+  }
+
+  allele_rarity <- args$allele_rarity
+  var_list <- merge(variant_list, subset(allele_rarity, list_label==list_label),
+                    by.x = c("chrom", "vid"),
+                    by.y = c("chrom", "variant"),
+                    all.x = TRUE)
+
+  var_list <- var_list[var_list$aac > 0 & var_list$rare,
+                       c("list_label","vid","chrom","pos","ref","alt",
+                         "weight","aaf","aac","rare","ultra_rare")]
+
+  # pseudo_marker_variants <- split(var_list[var_list$ultra_rare,],
+  #                                 var_list$weight[var_list$ultra_rare])
+  # names(pseudo_marker_variants) <- paste(list_label, names(pseudo_marker_variants), sep="_")
+
+  # genotypes <- genotypes[,colnames(genotypes) %in% var_list$vid[!var_list$ultra_rare]]
+
+  return(list(variant_list, var_list, genotypes))
+  
+}
+
+burst_mode_test_res <- bb$map_variant_lists(
+  variant_namespace = "UKB_200K_WES",
+  variant_lists = test_variants,
+  args = list(allele_rarity = allele_rarity),
+  func = burst_mode_test,
+  genotype_format = "dose_matrix",
+  matrix_dose_cutoff = 0 # NA's out low-confidence genotypes, as for PLINK1
+)
+```
+
+
+```{r}
+lapply(burst_mode_test_res, function(res) head(res[[1]]))
+lapply(burst_mode_test_res, function(res) head(res[[2]]))
+lapply(burst_mode_test_res, function(res) dim(res[[3]]))
+# $A4GALT
+# [1]   0 175
+# 
+# $A4GNT
+# [1] 200513    131
+# 
+# $APOL1
+# [1] 199140    168
+# 
+# $LRP2
+# [1]    0 1782
+# 
+# $MIOX
+# [1]   0 164
+# 
+# $PKD1
+# [1]    0 2590
+# 
+# $SLC6A19
+# [1]   0 299
+
+```
