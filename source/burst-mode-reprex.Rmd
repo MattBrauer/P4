@@ -57,16 +57,18 @@ bb <- connect(
   protocol = "https")
 ```
 
-```{r annotation-sources}
-ah <- AnnotationHub::AnnotationHub()
-edb <- ah[["AH109606"]]
-```
+
+
 This chunk builds the data frames `allele_rarity`, which contains filtered
 variants from the 200K WES namespace, their COAST weights, and columns with
 minor allele count and frequence, and `test_variants`, which is a subset of 7
 genes' variants for passing to MVL.
 
+Should be run once.
+
 ```{r build-data-set}
+ah <- AnnotationHub::AnnotationHub()
+edb <- ah[["AH109606"]]
 
 vars_df <- bb$get_variants(namespace='UKB_200K_WES')
 coast_df <- bb$get_annotation_frame("public",
@@ -170,12 +172,8 @@ burst_mode_test <- function(args, list_label, genotypes, variant_list) {
                        c("list_label","vid","chrom","pos","ref","alt",
                          "weight","aaf","aac","rare","ultra_rare")]
 
-  # pseudo_marker_variants <- split(var_list[var_list$ultra_rare,],
-  #                                 var_list$weight[var_list$ultra_rare])
-  # names(pseudo_marker_variants) <- paste(list_label, names(pseudo_marker_variants), sep="_")
-
-  # genotypes <- genotypes[,colnames(genotypes) %in% var_list$vid[!var_list$ultra_rare]]
-
+  ## return input variant list, variant list merged with additional features
+  ## from `allele_rarity` and genotypes for list label
   return(list(variant_list, var_list, genotypes))
   
 }
@@ -185,8 +183,8 @@ burst_mode_test_res <- bb$map_variant_lists(
   variant_lists = test_variants,
   args = list(allele_rarity = allele_rarity),
   func = burst_mode_test,
-  genotype_format = "dose_matrix",
-  matrix_dose_cutoff = 0 # NA's out low-confidence genotypes, as for PLINK1
+  genotype_format = "dose_matrix"#,
+  #matrix_dose_cutoff = 0 # NA's out low-confidence genotypes, as for PLINK1
 )
 ```
 
