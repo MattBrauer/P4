@@ -147,7 +147,10 @@ test_variants %>% saveRDS(fs::path(base_dir, "test_variants_reprex", ext="rds"))
 
 ```
 
+## Run burst mode
 
+Given variant data structures, execute a simple burst-mode MVL functoin that
+simple returns input, modified input and subset of genotypes for that input.
 
 ```{r simple-burst-mode-test}
 
