@@ -2,7 +2,7 @@
 #This generates input variant lists for VEP in a format that VEP likes
 MYDIR=/tmp/mbrauer
 #/home/mbrauer/staging
-NAMESPACE='UK_BIOBANK_470K_WES_LOW_MAF'
+NAMESPACE='UKB_200K_WES'
 set -ex
 iquery -aq "
 aio_save(

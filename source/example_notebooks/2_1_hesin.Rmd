@@ -1,0 +1,275 @@
+---
+title: "Paradigm4 HESIN query examples"
+output: html_document
+---
+
+PARADIGM4 INC.
+
+This file is distributed along with the Paradigm4 Enterprise SciDB 
+distribution kit and may only be used with a valid Paradigm4 contract 
+and in accord with the terms and conditions specified by that contract.
+
+Copyright (C) 2010 - 2021 Paradigm4 Inc.
+All Rights Reserved.
+
+# 0. Connecting
+```{r}
+library(biobank)
+```
+
+Replace the username with your own and enter your password when prompted
+```{r}
+bb <- connect(
+  host = "127.0.0.1",
+  username = 'scidbadmin',                  #replace with your username
+  password = rstudioapi::askForPassword(), 
+  port = 8083,
+  protocol = "https")
+bb$namespace='UK_BIOBANK'
+```
+
+Consult the following UKBB document for a summary of the data. Note the tables as described on Page 7:
+https://biobank.ctsu.ox.ac.uk/crystal/crystal/docs/HospitalEpisodeStatistics.pdf
+We have ingested only HESIN_DIAG, HESIN_OPER
+
+# 0.1 View available HESIN fields
+
+This call returns only the fields that are available - for use in other calls.
+```{r}
+bb$get_hesin_fields(namespace = 'UK_BIOBANK')
+```
+
+The main HESIN table joins to the other tables
+```{r}
+bb$get_hesin_fields(namespace = 'UK_BIOBANK', table=c('HESIN', 'HESIN_DIAG'))
+```
+
+# 1. Examples Querying DIAG data
+
+Query all individuals given one or more ICD10 codes:
+```{r}
+bb$get_hesin_diag('UK_BIOBANK', diag_icd10 = c('I209', 'I201'))
+```
+
+Query all data for an individual (or list of individuals)
+```{r}
+x = bb$get_hesin_diag('UK_BIOBANK', eid = c(2721341, 2779447))
+x[ order(x$eid), ]
+```
+
+## 1.1 Examples joining to ICD10 code meanings
+
+Get all the ICD10 codes in UKBB
+```{r}
+icd10 = bb$get_icd10(namespace = "UK_BIOBANK")
+icd10
+```
+
+Merge the codes with the result we retrieved previously - this yields a user-readable output
+```{r}
+xm = merge(x, icd10, by.x='diag_icd10', by.y='coding')
+xm[ order(xm$eid, xm$epistart), c('eid', 'epistart', 'level', 'diag_icd10', 'meaning')]
+```
+
+## 1.2 Examples using aggregates
+
+For two individuals, for each code they have, compute the number of times it was diagnosed and the longest hospital episode duration. Consult `?biobank_get_hesin_diag` for details.
+```{r}
+x = bb$get_hesin_diag('UK_BIOBANK', 
+                      eid = c(2721341, 2779447),
+                      fields = 'epidur',
+                      aggregate=c("count(*) as num_diagnoses", "max(epidur) as longest_episode_duration"),
+                      group_by=c("eid", "diag_icd10"))
+x[order(x$num_diagnoses, decreasing=T), ]
+```
+
+## 1.3 Examples using ICD10 Prefixes
+
+Find all diagnoses that start with 'J45'
+```{r}
+xx = bb$get_hesin_diag('UK_BIOBANK', diag_icd10_prefix = c('J45'))
+xx
+```
+
+Count the number of times each code occurs. J459 (unspecified asthma) is most common
+```{r}
+table(xx$diag_icd10)
+```
+
+# 1.5 Example: starting with 'asthma' and finding all cases
+
+First - find all codes for asthma. Use "get_encoding" to retrieve value/meaning pairs for the biobank
+```{r}
+?biobank_get_encoding
+```
+
+ICD10 diagnoses are captured in UK Biobank encoding 19. 
+For example, see https://biobank.ndph.ox.ac.uk/showcase/field.cgi?id=41270
+```{r}
+icd10_encoding = bb$get_encoding('UK_BIOBANK', encoding_id = 19)
+icd10_encoding
+```
+You can also download all encodings at once by omitting the 'encoding_id=' argument
+
+Search ICD10 codes for asthma
+```{r}
+asthma_codes = subset(icd10_encoding, grepl('asthma', meaning, ignore.case = T))
+asthma_codes
+```
+
+Alternative: you can use the get_icd10 function which does some additional expansion of hierarchies
+Note: this matches T48.6 "Antiasthmatics" and because expand=T is set, this brings in parents and siblings of that code
+```{r}
+alternative_asthma_codes = bb$get_icd10('UK_BIOBANK', name = 'asthma', expand = T)
+alternative_asthma_codes
+```
+
+Query HESIN for asthma codes
+```{r}
+asthma_hesin = bb$get_hesin_diag('UK_BIOBANK', diag_icd10 = asthma_codes$value)
+asthma_hesin
+```
+
+Join the results to code to decorate them with meanings
+```{r}
+asthma_hesin = merge(asthma_hesin, icd10, by.x='diag_icd10', by.y='coding')
+asthma_hesin
+```
+
+Alternatively:
+```{r}
+asthma_hesin = bb$get_hesin_diag('UK_BIOBANK', diag_icd10 = alternative_asthma_codes$coding)
+asthma_hesin
+```
+
+# 1.6 Example Retrieving Other Fields
+
+The `fields=` argument can be used to fetch any of the other HESIN fields 
+```{r}
+bb$get_hesin_diag('UK_BIOBANK', diag_icd10 = 'I209', fields = c('bedyear', 'speldur', 'epitype'))
+```
+
+# 2. Querying Surgical Procedure (HESIN_OPER) data
+
+Note the `data_coding` field that can be used to retrieve field meanings
+```{r}
+bb$get_hesin_fields(namespace = 'UK_BIOBANK', table = c('HESIN_OPER'))
+```
+
+View documentation for get_hesin_oper
+```{r}
+?biobank_get_hesin_oper
+```
+
+```{r}
+opcs4 = bb$get_encoding('UK_BIOBANK', encoding_id = 240)
+opcs4
+```
+
+Search op codes for a proceudre we are interested in - "angioplasty"
+```{r}
+opcs4[grepl('angioplasty', opcs4$meaning, ignore.case = T), ]
+```
+
+Let's use a selection of K49 codes. Note there's an OPDATE in DD/MM/YYY format. It falls between epistart and epiend and is represented as a character string at the moment.
+```{r}
+k49_oper = bb$get_hesin_oper('UK_BIOBANK', oper4 = c('K49', 'K491', 'K492', 'K493', 'K494'))
+k49_oper
+```
+
+Join to the codes to annotate
+```{r}
+merge( k49_oper[c('eid', 'epistart', 'epiend', 'oper4')], opcs4[c('value', 'meaning')], by.x='oper4', by.y='value')
+```
+
+# 3. NOT LOADED - Get Maternity Data
+
+Similar to previous examples
+```{r}
+?biobank_get_hesin_maternity
+```
+
+```{r}
+bb$get_hesin_fields('UK_BIOBANK', table = 'HESIN_MATERNITY')
+```
+
+Find all maternity records with a post-natal stay of 10 days or more
+```{r}
+x = bb$get_hesin_maternity('UK_BIOBANK', post_dur_range = c(10,NA))
+x
+```
+
+# 4. NOT LOADED - Get Delivery Data
+
+Similar to previous examples
+```{r}
+?biobank_get_hesin_delivery
+```
+
+```{r}
+bb$get_hesin_fields('UK_BIOBANK', table = 'HESIN_DELIVERY')
+```
+
+Find all deliveries with gestation of 32 weeks or below
+```{r}
+bb$get_hesin_delivery('UK_BIOBANK', gestation_range = c(NA, 32))
+```
+
+Another example - count deliveries by status and sex of baby
+```{r}
+counts = bb$get_hesin_delivery('UK_BIOBANK', aggregate="count(*)", group_by=c("sexbaby", "delstat"))
+counts = merge(counts, bb$get_encoding(encoding_id = 224)[c('value', 'meaning')], by.x='sexbaby', by.y='value')
+colnames(counts) = c('sexbaby', 'delstat', 'count', 'sex')
+counts = merge(counts, bb$get_encoding(encoding_id = 225)[c('value', 'meaning')], by.x='delstat', by.y='value')
+colnames(counts) = c('sexbaby', 'delstat', 'count', 'sex', 'delivery_status')
+counts = counts[c('sex', 'delivery_status', 'count')]
+counts
+```
+
+# 5. NOT LOADED - Critical Care
+
+Look up example discharge codes
+```{r}
+bb$get_encoding(namespace = 'UK_BIOBANK', encoding_id = 7009)
+```
+
+Look up critical care episodes with discharge status 1 or 7 
+(successful discharge or discharge against medical advice) 
+and a level-2 care duration of 5 days or more
+```{r}
+bb$get_hesin_critical(namespace = 'UK_BIOBANK', ccdisstat = c(1, 7), cclev2days_range = c(5,NA))
+```
+
+Look up individuals with more than 10 critical care episodes
+```{r}
+xx = bb$get_hesin_critical(namespace = 'UK_BIOBANK', 
+                      aggregate = "count(*) as num_critical_care_episodes", 
+                      group_by = "eid")
+subset(xx, num_critical_care_episodes>10)
+```
+
+# X: Admin Section: Updating Data
+
+Admin users may update the HESIN data like so. This will only work for users who have administrator privileges. First, download the updated files from UKBB and place them on the server into a directory like ~/hesin.
+Make sure to use the full directory path here, like '/home/USERNAME/hesin'. Do not use '~'.
+You'll also need Linux user write permissions to that directory to download HESDataDic.xlsx.
+```{r}
+library(data.table)
+bb$load_hesin_data(namespace = 'UK_BIOBANK', 
+                   data_path = '/path/to/hesin')
+```
+
+Example output with row counts:
+[1] ">>> Downloading codings information"
+2021-05-13 15:05:40 (129 KB/s) - ‘HESDataDic.xlsx’ saved [99663/99663]
+[1] ">>> Extracting codings"
+[1] ">>> Uploading table HESIN"                                                                                           [1] ">>> Loaded records: 3738547"
+[1] ">>> Uploading table HESIN_DIAG"
+[1] ">>> Loaded records: 14006185"
+[1] ">>> Uploading table HESIN_OPER"
+[1] ">>> Loaded records: 7607580"
+[1] ">>> Uploading table HESIN_FIELDS"
+[1] ">>> Loaded records: 121"
+File /staging/hesin/hesin_psych.txt does not exist. Skipping HESIN_PSYCH.
+File /staging/hesin/hesin_maternity.txt does not exist. Skipping HESIN_MATERNITY.
+File /staging/hesin/hesin_delivery.txt does not exist. Skipping HESIN_DELIVERY.

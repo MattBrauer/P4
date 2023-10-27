@@ -1,0 +1,717 @@
+---
+title: "Paradigm4 Training Notebook, Day 2"
+output: html_document
+---
+
+PARADIGM4 INC.
+
+This file is distributed along with the Paradigm4 Enterprise SciDB 
+distribution kit and may only be used with a valid Paradigm4 contract 
+and in accord with the terms and conditions specified by that contract.
+
+Copyright (C) 2010 - 2021 Paradigm4 Inc.
+All Rights Reserved.
+
+# 0. Connecting
+```{r}
+library(biobank)
+```
+
+```{r}
+bb <- connect(
+  host = "127.0.0.1",
+  username = 'scidbadmin',                  #replace with your username
+  password = rstudioapi::askForPassword(), 
+  port = 8083,
+  protocol = "https")
+bb$namespace='UK_BIOBANK'
+```
+
+# 1. Phenotype Sets
+
+Note: by now we have a number of Phenotype Sets in the system. Phenotype Sets are defined over fields and participants.
+```{r}
+bb$list_phenotype_sets('UK_BIOBANK')
+```
+
+## 1.1. Browse sets created by UI cohort selector
+
+Whenever someone creates a Phenotype Set in the Cohort Selector GUI, it is uploaded to the namespace "UI_COHORTS".
+```{r}
+l = bb$list_phenotype_sets(namespace = 'UI_COHORTS')
+l
+```
+
+Note that Cohort Selector Phenotype Sets are essentially lists of EIDs for now. Their 'note' fields are URL-encoded conditions
+```{r}
+jsonlite::fromJSON(URLdecode(l$note[2]))
+```
+
+```{r}
+eid = bb$get_participants(namespace = 'UI_COHORTS', phenotype_set = 'UKB_200K_WES_SAMPLES')
+eid
+```
+
+Deleting Phenotyope sets
+```{r}
+#bb$delete_phenotype_set('UI_COHORTS', 'tester')
+```
+
+
+
+## 1.2  Create a small phenotype set
+
+### 1.2.1 Start with all participants
+```{r}
+all_participants = bb$get_participants(namespace='UK_BIOBANK')
+phenos = all_participants
+```
+
+### 1.2.2 Add G30: Alzheimer's disease
+```{r}
+icd10_alzheimers = bb$get_phenotype_data(
+  namespace = 'UK_BIOBANK',
+  phenotype_set = 'UKBB_43361',
+  field_id = 41270, 
+  value_prefix = 'G30'
+)
+phenos$icd10_alzheimers = 0
+phenos$icd10_alzheimers [ phenos$eid %in% icd10_alzheimers$eid ] = 1
+```
+
+### 1.2.3 Add I10: hypertension
+```{r}
+icd10_hypertension = bb$get_phenotype_data(
+  namespace = 'UK_BIOBANK',
+  phenotype_set = 'UKBB_43361',
+  field_id = 41270, 
+  value_prefix = 'I10'
+)
+phenos$icd10_hypertension = 0
+phenos$icd10_hypertension [ phenos$eid %in% icd10_hypertension$eid ] = 1
+```
+
+### 1.2.4 Add J45: Asthma
+```{r}
+icd10_asthma = bb$get_phenotype_data(
+  namespace = 'UK_BIOBANK',
+  phenotype_set = 'UKBB_43361',
+  field_id = 41270, 
+  value_prefix = 'J45'
+)
+phenos$icd10_asthma = 0
+phenos$icd10_asthma [ phenos$eid %in% icd10_asthma$eid ] = 1
+```
+
+### 1.2.5 Add self-reported high cholesterol
+```{r}
+sr_high_cholesterol = bb$get_phenotype_data(
+  namespace = 'UK_BIOBANK',
+  phenotype_set = 'UKBB_43361',
+  field_id = 20002, 
+  value_prefix = '1473'
+)
+phenos$sr_high_cholesterol = 0
+phenos$sr_high_cholesterol [ phenos$eid %in% sr_high_cholesterol$eid ] = 1
+phenos
+```
+
+### 1.2.6 Upload
+
+You won't be able to run the delete / upload unless you have permissions the the UK_BIOBANK namespace.
+
+```{r}
+#bb$delete_phenotype_set('UK_BIOBANK', 'EXAMPLE_GWAS_CATEGORICAL_PHENOS')
+```
+
+```{r}
+bb$upload_phenotype_set(
+  namespace = 'UK_BIOBANK', 
+  phenotype_set_name = 'EXAMPLE_GWAS_CATEGORICAL_PHENOS', 
+  note = 'A few example categorical phenotypes.', 
+  data = phenos[c('eid', 'icd10_alzheimers', 'icd10_hypertension', 'icd10_asthma', 'sr_high_cholesterol')],
+  value_type = c('Categorical (single)', 'Categorical (single)', 'Categorical (single)', 'Categorical (single)'),
+  description = c('Alzheimers disease ICD10 Code G30', 
+                  'Hypertension ICD10 Code I10',
+                  'Asthma ICD10 Code J45',
+                  'Self-reported high cholesterol'),
+  notes = c('From UKBB_43361, field 41270, prefix G30',
+            'From UKBB_43361, field 41270, prefix I10',
+            'From UKBB_43361, field 41270, prefix J45',
+            'From UKBB_43361, field 20002, value 1473')
+)
+
+```
+
+```{r}
+bb$list_phenotype_sets(namespace = "UK_BIOBANK")
+```
+
+# 2. Subset Phenotype set for demo purposes
+For demonstration purposes, we'll use a few of our categorical phenotypes. To make a demo that finishes reasonably (and to show upload capabilities) we'll make a phenotype subset using 50,000 randomly selected individuals. 
+
+Revisit the categorical phenotypes we've created:
+```{r}
+cat_phenos = bb$get_phenotype_fields('UK_BIOBANK', 'EXAMPLE_GWAS_CATEGORICAL_PHENOS')
+cat_phenos[order(cat_phenos$number_of_participants, decreasing = T), ]
+```
+
+We'll keep using the "WHITE_BRITISH_UNRELATED_COVARIATES" set for covariates.
+```{r}
+bb$get_phenotype_fields('UK_BIOBANK', 'WHITE_BRITISH_UNRELATED_COVARIATES')
+```
+
+Select 50,000 british individuals randomly
+```{r}
+eid_subsample = bb$get_participants('UK_BIOBANK', 'WHITE_BRITISH_UNRELATED_COVARIATES')
+eid_subsample = eid_subsample[ sample(1:nrow(eid_subsample), 50000), , drop=F]
+eid_subsample
+```
+
+For those 50,000 individuals, pull out a selection of fields from our CATEGORICAL set - a few diagnoses and self-reported diseases.
+```{r}
+data = bb$get_phenotype_data(namespace ='UK_BIOBANK', phenotype_set='EXAMPLE_GWAS_CATEGORICAL_PHENOS', 
+                             field_id=c(0,1,2,3),  
+                             eid=eid_subsample$eid, 
+                             value_cast='double',
+                             all_eids = T)[c('eid', 'title', 'value')]
+data
+```
+
+Convert to tabular form
+```{r}
+data = data.table::dcast(data, eid ~ title)
+data
+```
+
+Give them names that include "subset" just so we can delineate them easier
+```{r}
+colnames(data) = c('eid', 'icd10_alzheimers_subset', 'icd10_asthma_subset', 'icd10_hypertension_subset', 'sr_high_cholesterol_subset')
+data
+```
+
+## 2.1 Upload into a smaller set
+
+We'll now upload the table into a new Phenotype Set to run SAIGE on.
+
+Delete if exists
+```{r}
+#bb$delete_phenotype_set(namespace= 'public', phenotype_set = 'CATEGORICAL_SUBSET_50K')
+```
+
+And upload. By default this will leave a bunch of field-based metadata (field types, how they were generated) as `NA` - these
+are technically optional, but you should set them if possible.
+If multiple people run this notebook, you may "collide" with another user. You can avoid that by changing the name like "CATEGORICAL_SUBSET_50K_BOB" or using a different namespace (if available).  If you do, be sure to change the namespace and/or phenotype_set_name throughout the remainder of the notebook.
+```{r}
+bb$upload_phenotype_set(namespace = 'public', 
+                        phenotype_set_name = 'CATEGORICAL_SUBSET_50K', 
+                        data = data,
+                        verbose=TRUE,
+                        note = 'A few example categorical phenotypes, subset to 50K individuals', 
+                        value_type = c('Categorical (single)', 'Categorical (single)', 'Categorical (single)', 'Categorical (single)'),
+                        description = c('Alzheimers disease ICD10 Code G30', 
+                                        'Asthma ICD10 Code J45',
+                                        'Hypertension ICD10 Code I10',
+                                        'Self-reported high cholesterol'),
+                        notes = c('From UKBB_43361, field 41270, prefix G30',
+                                  'From UKBB_43361, field 41270, prefix J45',
+                                  'From UKBB_43361, field 41270, prefix I10',
+                                  'From UKBB_43361, field 20002, value 1473'))
+```
+
+### 2.1.1 Examine the uploaded set
+```{r}
+bb$list_phenotype_sets('public')
+```
+
+Note arguments `description` and `value_type` would be `NA` below had they not been set. The `notes` field defaults to the creation date. These values can be supplied at upload time and this is a recommended practice. See ?biobank_upload_phenotype_set
+```{r}
+bb$get_phenotype_fields('public', 'CATEGORICAL_SUBSET_50K')
+```
+
+You can also add or remove fields to/from an existing phenotype set, assuming you have permissions to the appropriate namespace:
+
+```{r}
+?biobank_add_phenotype_fields
+?biobank_delete_phenotype_fields
+```
+
+# 3. Searching Variants in Annotation Frames
+```{r}
+bb$list_annotation_frames(namespace = 'UK_BIOBANK')
+```
+
+```{r}
+bb$get_annotation_frame_fields(namespace = "UK_BIOBANK", annotation_frame = "VEP_LOFTEE_20210504")
+```
+
+You can search fields by many criteria.  This uses the same syntax as bb$search_variants.
+It's recommended to use as minimal a set of values for the fields argument as possible for your application, since this can drastically affect query time for annotation frames with a large number of annotation fields.
+```{r}
+pcsk9_vars = bb$get_annotation_frame(namespace = "UK_BIOBANK", 
+                        annotation_frame = "VEP_LOFTEE_20210504", 
+                        SIFT_contains = "tolerated",
+                        SIFT_score_range = c(0.10, NA),
+                        SYMBOL=c('PCSK9', 'IL33'),
+                        fields=c("CONSEQUENCE", "SYMBOL", "LoF", "TSL","SIFT","SIFT_score","DOMAINS"))
+pcsk9_vars
+```
+
+The list of variants may also have some annotation:
+```{r}
+bb$get_variant_fields(namespace = "UK_BIOBANK")
+```
+
+These can also be searched:
+```{r}
+pcsk9_vars = bb$get_variants(namespace='UK_BIOBANK', gene=c('PCSK9', 'IL33'), info_score_range=c(0.8,NA))
+pcsk9_vars
+```
+
+It's possible to search by both an annotation frame's annotation and the namespace-level annotation.  Note that this will not return any variants that don't have annotation in the specified annotation frame.
+```{r}
+pcsk9_vars = bb$get_variants(namespace='UK_BIOBANK', gene=c('PCSK9', 'IL33'), info_score_range=c(0.8,NA))
+pcsk9_vars = bb$get_annotation_frame(namespace = "UK_BIOBANK", 
+                                     annotation_frame = "VEP_LOFTEE_20210504", 
+                                     CONSEQUENCE = c("intron_variant", "missense_variant", "downstream_gene_variant", "upstream_gene_variant"),
+                                     variant_list = pcsk9_vars, 
+                                     fields = c())
+pcsk9_vars
+```
+
+## 3.1 Aggregations
+You can use aggregations to quickly see what values of particular field has (among many other applications).  For example, if we wanted to know what values the IMPACT field can take on in VEP_LOFTEE_20210504 (so we can do a selection query):
+
+```{r}
+bb$get_annotation_frame(namespace = "UK_BIOBANK", 
+                        annotation_frame = "VEP_LOFTEE_20210504", 
+                        aggregate = "count(*)", 
+                        group_by = c("IMPACT")
+)
+```
+
+# 4. Association Sets
+## 4.1 View Association Set Fields
+
+We also have a number of Association Sets in the system.  Association Sets are defined over fields and variants.
+
+Note that Association Sets have a `variant_namespace` that they link to. Thus a set can exist in namespace 'public' and have a link to variants in 'UK_BIOBANK'. All available variant annotations in 'UK_BIOBANK' can be used to query association data.
+```{r}
+bb$list_association_sets('UK_BIOBANK')
+```
+
+```{r}
+bb$list_association_sets('public')
+```
+
+Association sets are organized by phenotype fields and variants. It is important to remember that each field technically represents an _association calculation_ - a particular phenotype analyzed with a particular tool and set of covariates. Use `get_phenotype_fields( association_set=... )` to list the fields of a set. Note we used `run_association_job` to compute TEST_HIGH_CHOLESTEROL_STUDY and the metadata about the calculation are captured in "description" and "notes":
+```{r}
+bb$get_phenotype_fields(namespace = 'UK_BIOBANK', association_set = 'TEST_HIGH_CHOLESTEROL_STUDY')
+```
+
+RIVAS_PUBLIC_DATA was uploaded from the provided files. Since we uploaded it from stored files, the "description" and "notes" look different:
+```{r}
+fields = bb$get_phenotype_fields(namespace = 'UK_BIOBANK', association_set = 'RIVAS_PUBLIC_DATA')
+fields
+```
+
+## 4.2 Query Association Data
+
+You can query association data using a variety of options. For example, this returns all associations for code "HC382_asthma" with pvalue less than or equal to 1e-5 in gene IL33:
+```{r}
+bb$get_association_data(namespace = 'UK_BIOBANK', association_set = 'RIVAS_PUBLIC_DATA',
+                        title = 'HC382_asthma', 
+                        max_pvalue = 1e-5, 
+                        gene = 'IL33'
+                        )
+```
+
+Return all data for gene IL33, for variants with HIGH impact:
+```{r}
+bb$get_association_data(namespace = 'UK_BIOBANK', 
+                        association_set = 'RIVAS_PUBLIC_DATA',
+                        variant_list = bb$get_annotation_frame(namespace = "UK_BIOBANK", 
+                                                               annotation_frame = "VEP_LOFTEE_20210504", 
+                                                               fields = c(), 
+                                                               SYMBOL='IL33', 
+                                                               IMPACT='HIGH')
+                        )
+```
+
+Get all data for code `HC382_asthma` but returning a narrower result: pvalue, beta, ref and alt. Note that chrom,pos are always returned:
+```{r}
+bb$get_association_data(namespace = 'UK_BIOBANK', association_set = 'RIVAS_PUBLIC_DATA',
+                        title = 'HC382_asthma',
+                        max_pvalue = 1e-8, 
+                        variant_fields = c('ref', 'alt'),
+                        association_fields = c('pvalue', 'beta')
+                      )
+```
+
+## 4.3 Aggregations
+
+The clauses `aggregate` and `group_by` can be used together with other arguments. The aggregation is computed after all of the subsetting is performed. In this example, we select pvalues 1e-10 and below in Asthma and Nasal Polyps associations; then compute the number of entries and lowest p-value for each phenotype that match the criteria.
+```{r}
+bb$get_association_data(namespace = 'UK_BIOBANK', association_set = 'RIVAS_PUBLIC_DATA',
+                        max_pvalue = 1e-10,
+                        title = c('HC382_asthma', 'HC156_nasal_polyps'),
+                        aggregate = c('count(*)', 'min(pvalue)'), 
+                        group_by = c('title')
+                      )
+```
+
+# 5. Single Variant PLINK
+
+We've previosly shown PLINK, but we'll run it again here with our 'CATEGORICAL_SUBSET_50K' phenotype set and the values from the (unique) variants we'd selected from the "VEP_LOFTEE_20210504" annotation frame for comparison purposes.
+
+```{r}
+r= bb$run_association_job(namespace='public',
+                          phenotype_set = 'CATEGORICAL_SUBSET_50K',
+                          phenotype_field_titles = bb$get_phenotype_fields('public', 'CATEGORICAL_SUBSET_50K')$title,
+                          
+                          covariate_namespace = 'UK_BIOBANK',
+                          covariate_phenotype_set = 'WHITE_BRITISH_UNRELATED_COVARIATES',
+                          covariate_field_titles = c('age', 'sex', 'pcomp_1', 'pcomp_2', 'pcomp_3', 'pcomp_4'),
+                           
+                          variant_namespace = 'UK_BIOBANK',
+                          variant_list = unique(pcsk9_vars[,c("chrom","pos","ref","alt")]),
+                          method = 'plink', 
+                          phenotype_na_replacement = 0)
+
+r[order(r$pvalue), ]
+```
+
+# 6. Single Variant SAIGE
+
+SAIGE is a two-step process and step 1 can take a significant amount of time for large populations. For the White British subset (N~=337,000) SAIGE step 1 can take 1-2 hours per phenotype. And this step must be re-computed for each phenotype / covariate combination. See https://github.com/weizhouUMICH/SAIGE/issues/92
+
+To assist with this, P4 built a caching layer to persist Step 1 results so they can be re-used as much as possible. This section demonstrates how the caching works.
+
+## 6.1 SAIGE Dry-Run. 
+
+The `saige_dry_run` option is used to show which phenotypes have a step 1 precomputed. This returns quickly and should help users estimate which phenotypes may take longer. In this case, we have just created the set using randomly-sampled individuals. So all four phenotypes don't have a step 1 computed and they show up as `cached=FALSE` - unless another user beat you to it:
+```{r}
+bb$run_association_job(namespace='public',
+                       phenotype_set = 'CATEGORICAL_SUBSET_50K',
+                       phenotype_field_titles = bb$get_phenotype_fields('public', 'CATEGORICAL_SUBSET_50K')$title,
+                      
+                       covariate_namespace = 'UK_BIOBANK',
+                       covariate_phenotype_set = 'WHITE_BRITISH_UNRELATED_COVARIATES',
+                       covariate_field_titles = c('age', 'sex', 'pcomp_1', 'pcomp_2', 'pcomp_3', 'pcomp_4'),
+                       variant_namespace = 'UK_BIOBANK',
+                       variant_list = pcsk9_vars,
+                       method = 'saige', phenotype_na_replacement = 0, 
+                       
+                       saige_dry_run = T
+                       )
+```
+
+## 6.2 SAIGE Run
+
+We'll now run SAIGE on this data. This call will execute Step 1 and Step 2, one after another. Note the output. Note the Step 1 taking a bit of time ~20 minutes ETA on this sample size:
+```{r}
+rs = bb$run_association_job(namespace='public',
+                       phenotype_set = 'CATEGORICAL_SUBSET_50K',
+                       phenotype_field_titles = bb$get_phenotype_fields('public', 'CATEGORICAL_SUBSET_50K')$title,
+                      
+                       covariate_namespace = 'UK_BIOBANK',
+                       covariate_phenotype_set = 'WHITE_BRITISH_UNRELATED_COVARIATES',
+                       covariate_field_titles = c('age', 'sex', 'pcomp_1', 'pcomp_2', 'pcomp_3', 'pcomp_4'),
+                       variant_namespace = 'UK_BIOBANK',
+                       variant_list = unique(pcsk9_vars[,c("chrom","pos","ref","alt")]),
+                       method = 'saige', phenotype_na_replacement = 0
+                       )
+rs[order(rs$pvalue), ]
+```
+
+After this, a dry_run (with any variants) will confirm these phenotypes are cached.
+
+## 6.3 Next SAIGE Run
+
+Running more variants on these phenotypes will go much faster - now about as fast as plink.
+```{r}
+apoe_vars = bb$get_variants(namespace='UK_BIOBANK', gene='APOE', info_score_range=c(0.8,NA))
+apoe_vars
+```
+
+The 'dry_run" now shows the step 1 models will not need to be rebuilt
+```{r}
+bb$run_association_job(namespace='public',
+                       phenotype_set = 'CATEGORICAL_SUBSET_50K',
+                       phenotype_field_titles = bb$get_phenotype_fields('public', 'CATEGORICAL_SUBSET_50K')$title,
+                      
+                       covariate_namespace = 'UK_BIOBANK',
+                       covariate_phenotype_set = 'WHITE_BRITISH_UNRELATED_COVARIATES',
+                       covariate_field_titles = c('age', 'sex', 'pcomp_1', 'pcomp_2', 'pcomp_3', 'pcomp_4'),
+                       variant_namespace = 'UK_BIOBANK',
+                       variant_list = apoe_vars,
+                       method = 'saige', phenotype_na_replacement = 0,
+                       saige_dry_run = T
+                       )
+```
+
+
+```{r}
+rs_apoe= bb$run_association_job(namespace='public',
+                       phenotype_set = 'CATEGORICAL_SUBSET_50K',
+                       phenotype_field_titles = bb$get_phenotype_fields('public', 'CATEGORICAL_SUBSET_50K')$title,
+                      
+                       covariate_namespace = 'UK_BIOBANK',
+                       covariate_phenotype_set = 'WHITE_BRITISH_UNRELATED_COVARIATES',
+                       covariate_field_titles = c('age', 'sex', 'pcomp_1', 'pcomp_2', 'pcomp_3', 'pcomp_4'),
+                       variant_namespace = 'UK_BIOBANK',
+                       variant_list = apoe_vars,
+                       method = 'saige', phenotype_na_replacement = 0
+                       )
+rs_apoe[order(rs_apoe$pvalue), ]
+```
+
+We can also save results to the database as an "association set"
+```{r}
+bb$run_association_job(namespace='public',
+                       phenotype_set = 'CATEGORICAL_SUBSET_50K',
+                       phenotype_field_titles = bb$get_phenotype_fields('public', 'CATEGORICAL_SUBSET_50K')$title,
+                      
+                       covariate_namespace = 'UK_BIOBANK',
+                       covariate_phenotype_set = 'WHITE_BRITISH_UNRELATED_COVARIATES',
+                       covariate_field_titles = c('age', 'sex', 'pcomp_1', 'pcomp_2', 'pcomp_3', 'pcomp_4'),
+                       variant_namespace = 'UK_BIOBANK',
+                       variant_list = rbind(apoe_vars,unique(pcsk9_vars[,c("chrom","pos","ref","alt")])),
+                       method = 'saige', phenotype_na_replacement = 0,
+                       
+                       output_namespace = 'public',
+                       output_association_set = 'TEST_SAIGE_CATEGORICAL_SUBSET_50K',
+                       force_field_overwrite = T
+                       )
+```
+
+## 6.4 Examine Association Sets
+```{r}
+bb$list_association_sets(
+  namespace = 'public'
+)
+```
+
+```{r}
+bb$get_phenotype_fields(
+  namespace = 'public',
+  association_set = 'TEST_SAIGE_CATEGORICAL_SUBSET_50K'  #important to use 'association_set=' named argument for association sets
+)
+```
+
+Get all the data associations with pvalue < 0.1
+Many other options available; see ?biobank_get_association_data
+```{r}
+bb$get_association_data(
+  namespace='public', 
+  association_set = 'TEST_SAIGE_CATEGORICAL_SUBSET_50K',
+  max_pvalue = 0.1
+)
+```
+
+You can also view the association set in PheGe: http://scidb.mazetx.com:3838/phege/
+
+# 7. Single Variant REGENIE
+
+We'll also run REGENIE on this same set of individuals, phenotypes, and variants. REGENIE typically faster/less expensive than SAIGE but slower than PLINK, and has a similar Step 1 / Step 2 process as SAIGE.  Step 1 takes ~45 minutes here, in a single batch (vs 4 ~20 minute batches for SAIGE)
+
+Note: Burst REGENIE is still a new feature. As of this writing, REGENIE association results can't be directly saved to an association set. 
+
+```{r}
+rr = bb$run_association_job(namespace='public',
+                       phenotype_set = 'CATEGORICAL_SUBSET_50K',
+                       phenotype_field_titles = bb$get_phenotype_fields('public', 'CATEGORICAL_SUBSET_50K')$title,
+                      
+                       covariate_namespace = 'UK_BIOBANK',
+                       covariate_phenotype_set = 'WHITE_BRITISH_UNRELATED_COVARIATES',
+                       covariate_field_titles = c('age', 'sex', 'pcomp_1', 'pcomp_2', 'pcomp_3', 'pcomp_4'),
+                       variant_namespace = 'UK_BIOBANK',
+                       variant_list = unique(pcsk9_vars[,c("chrom","pos","ref","alt")]),
+                       method = 'regenie', phenotype_na_replacement = 0,
+                       
+                       #output_namespace = 'public',
+                       #output_association_set = 'TEST_REGENIE_CATEGORICAL_SUBSET_50K',
+                       #force_field_overwrite = T
+                       )
+```
+
+```{r}
+rr[order(rr$pvalue), ]
+```
+
+# 8. List-based SKAT 
+## 8.1 Using Stored Sets
+
+SKAT runs on on lists of variants. The input to SKAT must contain a "list_label" column that delineates how the variants are partitioned into lists. Often there is a list per gene, but variations on the theme are possible. 
+```{r}
+cholest_vars = bb$get_annotation_frame(namespace='UK_BIOBANK', 
+                                       annotation_frame = "VEP_LOFTEE_20210504",
+                                       SYMBOL=c('PCSK9', 'APOE', 'LDLR', 'INSIG2'),
+                                       fields = c(),
+                                       variant_list = bb$get_variants(namespace = "UK_BIOBANK", 
+                                                                      gene_name = c('PCSK9', 'APOE', 'LDLR', 'INSIG2'),
+                                                                      info_score_range=c(0.8,NA)))
+cholest_vars
+```
+
+Remember that annotation frames already have a list_label column.  You can still change list label as appropriate or add it manually to a list of variants.
+
+This takes ~ 5 minutes
+```{r}
+x = bb$compute_skat(namespace = 'UK_BIOBANK',
+                phenotype_set = 'EXAMPLE_GWAS_CATEGORICAL_PHENOS',
+                phenotype_field_title = 'sr_high_cholesterol',
+                covariate_namespace = 'UK_BIOBANK',
+                covariate_phenotype_set = 'WHITE_BRITISH_UNRELATED_COVARIATES',
+                covariate_field_titles = c('age', 'sex', 'pcomp_1', 'pcomp_2', 'pcomp_3', 'pcomp_4'),
+                variant_namespace = 'UK_BIOBANK',
+                variant_list = cholest_vars,
+                phenotype_na_replacement = 0,
+                skat_method = 'davies'
+               )
+```
+
+```{r}
+x
+```
+
+```{r}
+x$note[2]
+```
+
+```{r}
+jsonlite::fromJSON(x$model_payload[2])
+```
+
+## 8.2 Continuous Sets
+Note: use "skat_out_type = 'C'" for continuous sets.
+
+## 8.3 Many other Options
+For all the various skat arguments see:
+```{r}
+?biobank_compute_skat
+```
+
+
+# 9. List-based SAIGE-GENE
+SAIGE-Gene run time is complex - increasing with the number of variants in a list but also depends on the data itself; some genes take longer than others.  We've again subset to 50K individuals - this subset example takes ~40 minutes (assuming no Step 1 models are cached), while a full run run takes a while (~8 hours).  
+
+It's also possible to save the results of list-based methods to the database, as "gene association sets"
+```{r}
+bb$compute_saige_gene(
+  namespace = 'public', 
+  phenotype_set = 'CATEGORICAL_SUBSET_50K',
+  phenotype_field_titles = c('sr_high_cholesterol_subset'
+                             ),
+  phenotype_na_replacement = '0',
+  
+  covariate_namespace = "UK_BIOBANK",
+  covariate_phenotype_set = 'WHITE_BRITISH_UNRELATED_COVARIATES',
+  covariate_field_titles = c('age', 'sex', 'pcomp_1', 'pcomp_2', 'pcomp_3', 'pcomp_4'),
+  
+  variant_namespace = 'UK_BIOBANK',
+  
+  variant_lists = cholest_vars, 
+  
+  output_namespace = "public", 
+  output_gene_association_set = "TEST_SAIGE_GENE_CHOLEST"
+)
+```
+
+## 9.1 Gene Association Sets
+```{r}
+bb$list_gene_association_sets(namespace = "public")
+```
+
+```{r}
+bb$get_gene_association_data(namespace = "public", gene_association_set = "TEST_SAIGE_GENE_CHOLEST")
+```
+
+This also has arguments to filter the results returned.
+```{r}
+?biobank_get_gene_association_data
+```
+
+You can also retreive the variant list used to run the gene association job.
+```{r}
+bb$get_gene_association_set_variants(namespace = "public", gene_association_set = "TEST_SAIGE_GENE_CHOLEST", expand = T)
+```
+
+# 10. List-based REGENIE-GENE
+
+Regenie also has a list-based version.  Here we compute REGENIE-GENE on the same data as SAIGE-GENE, which also takes ~40 minutes.
+
+```{r}
+regenie_gene_result = bb$compute_regenie_gene(
+  namespace = 'public', 
+  phenotype_set = 'CATEGORICAL_SUBSET_50K',
+  phenotype_field_titles = c('sr_high_cholesterol_subset'
+                             ),
+  phenotype_na_replacement = '0',
+  
+  covariate_namespace = "UK_BIOBANK",
+  covariate_phenotype_set = 'WHITE_BRITISH_UNRELATED_COVARIATES',
+  covariate_field_titles = c('age', 'sex', 'pcomp_1', 'pcomp_2', 'pcomp_3', 'pcomp_4'),
+  
+  variant_namespace = 'UK_BIOBANK',
+  
+  variant_lists = cholest_vars
+)
+regenie_gene_result[order(regenie_gene_result$pvalue), ]
+```
+
+# 11. MVL- Map Variant Lists
+
+## 11.1 Simple example: gene-level AAF
+
+Computes the alternate allele frequency (aaf) of each variant in the gene. May not be as interesting in practice but helps illustrate the example of evaluating lists of variants at a time.
+For use with `map_variant_lists`, the function must accept 3 arguments: 
+ 1. `args`: the context passed to the function
+ 2. `list_label`: the name or identifier of this particular set of variants
+ 3. `g`: the genotype data
+The `list_label` is provided to the function in case the logic includes special cases for specific lists 
+```{r}
+gene_aaf = function(args, list_label, g) {
+  return(colMeans(g, na.rm=T)/2)
+}
+```
+
+Create a list of PCSK9 variants
+```{r}
+pcsk9_variants = bb$get_variants('UK_BIOBANK', gene='PCSK9', info_score = 1)
+pcsk9_variants
+```
+
+Extract the matrix for the whole list at once
+```{r}
+pcsk9_genotypes = bb$get_genotypes(namespace='UK_BIOBANK', variant_list = pcsk9_variants, format='dose_matrix')
+dim(pcsk9_genotypes)
+```
+
+Call the function
+```{r}
+gene_aaf(args=list(), list_label = 'PCSK9', pcsk9_genotypes)
+```
+
+Now we'll use a larger list of variants for a few genes
+
+The variants provided to the function must have a `list_label` field. It is very often that the `list_label` matches the gene name
+```{r}
+head(pcsk9_vars)
+dim(pcsk9_vars)
+```
+
+Run in burst mode
+```{r}
+mvl_result = bb$map_variant_lists(namespace = 'UK_BIOBANK',
+                     func = gene_aaf,
+                     args = list(),
+                     variant_lists = pcsk9_vars,
+                     genotype_format = 'dose_matrix')
+```
+
+Note: now the result is a list and the `names()` of it correspond to list labels
+```{r}
+mvl_result[['ENSG00000169174']]
+```
+

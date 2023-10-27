@@ -1,0 +1,263 @@
+---
+title: "Paradigm4 Training Notebook: Phenotype Set Construction"
+output: html_document
+---
+
+PARADIGM4 INC.
+
+This file is distributed along with the Paradigm4 Enterprise SciDB 
+distribution kit and may only be used with a valid Paradigm4 contract 
+and in accord with the terms and conditions specified by that contract.
+
+Copyright (C) 2010 - 2020 Paradigm4 Inc.
+All Rights Reserved.
+
+Update: 20201130 - new version of biobank forbids phenotype field titles with '.' in the name. Adjusted our ALL_ sets accordingly.
+
+# 0. Connecting
+```{r}
+library(biobank)
+```
+
+NOTE: Replace with your username and save a copy of this notebook to your home directory
+```{r}
+bb <- connect(
+  host = "127.0.0.1",
+  username = 'scidbadmin',
+  password = rstudioapi::askForPassword(),
+  port = 8083,
+  protocol = "https")
+bb$namespace='UK_BIOBANK'
+```
+
+
+## 1. Unrelated White British Covariates
+
+### 1.1. Remove Heterozygosity Outliers
+Note we use `value=NULL` to retrieve entries where the field is NOT populated
+```{r}
+all_participants = bb$get_participants(namespace='UK_BIOBANK')
+non_outliers <- bb$get_phenotype_data(namespace='UK_BIOBANK', 
+                                      phenotype_set = "UKBB_43361",
+                                      field_id = 22027, value = NULL)
+nrow(all_participants) - nrow(non_outliers)
+```
+
+```{r}
+eids = non_outliers['eid']
+nrow(eids)
+```
+
+### 1.2. Remove: “Submitted.Gender” != “Inferred.Gender”
+```{r}
+submitted_gender <- bb$get_phenotype_data(namespace='UK_BIOBANK', phenotype_set = "UKBB_43361", field_id = 31)[c("eid", "value")]
+inferred_gender <- bb$get_phenotype_data(namespace='UK_BIOBANK', phenotype_set = "UKBB_43361", field_id = 22001)[c("eid", "value")]
+eids_filter <- merge(submitted_gender, inferred_gender)["eid"]
+eids <- merge(eids, eids_filter)
+nrow(eids)
+```
+
+### 1.3 Remove: “Putative.sex.chromosome.aneuploidy” == 1
+```{r}
+eids_filter <- bb$get_phenotype_data(namespace='UK_BIOBANK', phenotype_set = "UKBB_43361", field_id = 22019, value=NULL)
+eids <- merge(eids, eids_filter)
+nrow(eids)
+```
+
+### 1.4. Subset to British White Ancestry
+```{r}
+eids_filter <- bb$get_phenotype_data(namespace='UK_BIOBANK', phenotype_set = "UKBB_43361", field_id = 22006, value_prefix = 1)["eid"]
+eids <- merge(eids, eids_filter)
+nrow(eids)
+```
+
+### 1.5. Remove relatives
+```{r}
+eids_filter <- bb$get_phenotype_data(namespace='UK_BIOBANK', phenotype_set = "UKBB_43361", field_id = 22020, value_prefix = 1)["eid"]
+eids <- merge(eids, eids_filter)
+nrow(eids)
+```
+
+### 1.6. Remove: “excluded.from.kinship.inference” ==1 and “excess.relatives” == 1
+```{r}
+eids_filter <- bb$get_phenotype_data(namespace='UK_BIOBANK', phenotype_set = "UKBB_43361", field_id = 22021, value = c(0, 1))["eid"]
+eids <- merge(eids, eids_filter)
+nrow(eids)
+```
+
+Thus we arrive at a "White British Unrelated" subpopulation.
+
+### 1.7 Age at enrollment
+```{r}
+eids_filter <- bb$get_phenotype_data(namespace='UK_BIOBANK',phenotype_set = "UKBB_43361", 
+                                     field_id = 21022, value_cast='double')[c("eid", "value")]
+eids_filter$age <- eids_filter$value
+eids_filter$value <- NULL
+eids <- merge(x = eids, y = eids_filter, all.x = TRUE)
+eids = eids[, c('eid', 'age')]
+eids
+```
+
+### 1.8 Sex
+```{r}
+eids_filter <- bb$get_phenotype_data(namespace='UK_BIOBANK', phenotype_set = "UKBB_43361", field_id = 31,
+                                     value_cast='double')[c("eid", "value")]
+eids_filter$sex <- eids_filter$value
+eids_filter$value <- NULL
+eids <- merge(x = eids, y = eids_filter, all.x = TRUE)
+eids
+```
+
+### 1.9 First 10 principal components
+Note we use the data.table function dcast to convert principal components to separate columns.
+```{r}
+eids_filter <- bb$get_phenotype_data(phenotype_set = "UKBB_43361", field_id = 22009,
+                                     index_range = c(1, 10), value_cast="float")
+eids_filter <- reshape2::dcast(eids_filter, eid ~ index)
+field_names <- names(eids_filter)
+names(eids_filter) <- c("eid", paste0("pcomp_", field_names[2:length(field_names)]))
+eids <- merge(x = eids, y = eids_filter, all.x = TRUE)
+eids
+```
+
+This will be a data frame we upload
+```{r}
+was_phenos=eids
+was_phenos
+```
+
+### 1.10 Upload
+
+Note: your account may not have permissions to modify namespace 'UK_BIOBANK' but you can upload sets to namespace 'public'
+```{r}
+bb$delete_phenotype_set('UK_BIOBANK', 'WHITE_BRITISH_UNRELATED_COVARIATES')
+```
+
+```{r}
+bb$upload_phenotype_set(
+  namespace = 'UK_BIOBANK', 
+  phenotype_set_name = 'WHITE_BRITISH_UNRELATED_COVARIATES', 
+  note = 'Age, Sex and first 10 Principal Components across the unrelated White British subpopulation', 
+  data = was_phenos[c('eid', 'age', 'sex', 'pcomp_1', 'pcomp_2', 'pcomp_3', 'pcomp_4', 'pcomp_5', 'pcomp_6', 'pcomp_7', 'pcomp_8', 'pcomp_9', 'pcomp_10')],
+  value_type = rep('Continuous', 12),
+  description = c('Age at recruitment',
+                  'Sex', 
+                  'Principal Component 1',
+                  'Principal Component 2',
+                  'Principal Component 3',
+                  'Principal Component 4',
+                  'Principal Component 5',
+                  'Principal Component 6',
+                  'Principal Component 7',
+                  'Principal Component 8',
+                  'Principal Component 9',
+                  'Principal Component 10'),
+  notes = c('From UKBB_43361, field 21022',
+            'From UKBB_43361, field 31',
+            'From UKBB_43361, field 22009',
+            'From UKBB_43361, field 22009',
+            'From UKBB_43361, field 22009',
+            'From UKBB_43361, field 22009',
+            'From UKBB_43361, field 22009',
+            'From UKBB_43361, field 22009',
+            'From UKBB_43361, field 22009',
+            'From UKBB_43361, field 22009',
+            'From UKBB_43361, field 22009',
+            'From UKBB_43361, field 22009')
+)
+
+```
+
+```{r}
+bb$list_phenotype_sets('UK_BIOBANK')
+```
+
+```{r}
+bb$get_phenotype_fields('UK_BIOBANK', 'WHITE_BRITISH_UNRELATED_COVARIATES')
+```
+
+## 2. Example Continuous and Categorical Phenotypes
+
+### 2.1 Start with all participants
+```{r}
+all_participants = bb$get_participants(namespace='UK_BIOBANK')
+phenos = all_participants
+phenos
+```
+
+### 2.2 Add E78: high cholesterol
+```{r}
+e78_high_cholesterol = bb$get_phenotype_data(
+  namespace = 'UK_BIOBANK',
+  phenotype_set = 'UKBB_43361',
+  field_id = 41270, 
+  value_prefix = 'E78'
+)
+phenos$e78_high_cholesterol = 0
+phenos$e78_high_cholesterol [ phenos$eid %in% e78_high_cholesterol$eid ] = 1
+phenos
+```
+
+### 2.3 Add self-reported high cholesterol
+```{r}
+sr_high_cholesterol = bb$get_phenotype_data(
+  namespace = 'UK_BIOBANK',
+  phenotype_set = 'UKBB_43361',
+  field_id = 20002, 
+  value_prefix = '1473'
+)
+phenos$sr_high_cholesterol = 0
+phenos$sr_high_cholesterol [ phenos$eid %in% sr_high_cholesterol$eid ] = 1
+phenos
+```
+
+### 2.4 Add a field for combined (self-reported or e78)
+```{r}
+phenos$high_cholesterol_combined = as.numeric(phenos$e78_high_cholesterol | phenos$sr_high_cholesterol)
+phenos
+```
+
+### 2.5 Add continuous field for LDL direct, inverse-rank normal transformed
+```{r}
+ldl_direct = bb$get_phenotype_data(
+  namespace = 'UK_BIOBANK',
+  phenotype_set = 'UKBB_43361',
+  field_id = 30780, 
+  value_cast = 'double',
+  instance = 0, #important: don't capture repeat measures
+  index = 0
+)
+ldl_direct = ldl_direct[, c('eid', 'value')]
+colnames(ldl_direct) = c('eid', 'ldl_direct')
+ldl_direct$ldl_direct = RNOmni::RankNorm(ldl_direct$ldl_direct)
+phenos = merge( phenos, ldl_direct, all.x = T)
+phenos
+```
+
+### 2.6 Upload
+```{r}
+bb$delete_phenotype_set('UK_BIOBANK', 'EXAMPLE_GWAS_PHENOS')
+```
+
+```{r}
+bb$upload_phenotype_set(
+  namespace = 'UK_BIOBANK', 
+  phenotype_set_name = 'EXAMPLE_GWAS_PHENOS', 
+  note = 'A few example phenotypes related to high cholesterol, across all participants.', 
+  data = phenos[c('eid', 'e78_high_cholesterol', 'sr_high_cholesterol', 'high_cholesterol_combined', 'ldl_direct')],
+  value_type = c('Categorical (single)', 'Categorical (single)', 'Categorical (single)', 'Continuous'),
+  description = c('Hypercholesterolemia ICD10 Code E78', 
+                  'Self-reported high cholesterol',
+                  'ICD10 Code E78 or Self-reported high cholesterol',
+                  'LDL Direct continuous measurement, rank-normalized'),
+  notes = c('From UKBB_43361, field 41270, prefix E78',
+            'From UKBB_43361, field 20002, value 1473',
+            'From UKBB_43361, field 41270, prefix E78 OR field 20002, value 1473',
+            'From UKBB_43361, field 30780, instance 0')
+)
+
+```
+
+```{r}
+bb$list_phenotype_sets('UK_BIOBANK')
+```

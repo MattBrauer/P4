@@ -1,0 +1,84 @@
+---
+title: "Installing Paradigm4 packages"
+output: html_notebook
+---
+
+Copyright Paradigm4 2023 &copy;
+
+Follow these instructions to install the Reveal:Biobank&trade; client package on your
+local machine, to allow remote connections to SciDB. For now, use of the maze
+VPN is required to connect.
+
+## Install bioconductor dependencies
+
+```{r echo=TRUE, results='hide'}
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install("IRanges")
+```
+
+Test IRanges installation:
+
+```{r echo=TRUE, results='hide'}
+library(IRanges)
+```
+
+
+## Install arrow
+
+This is needed for fast data download from SciDB. It depends on (and
+automatically installs) the arrow system library; that step can require
+additional configuration. If you aren't able to successfully install arrow,
+you can move on to the next step; most functionality in biobank will work
+without arrow (though some legacy datasets require it).
+
+```{r echo=TRUE, results='hide'}
+install.packages("arrow")
+```
+
+Test arrow installation:
+
+```{r}
+library(arrow, warn.conflicts = F)
+dat <- arrow_table(x = 1:3, y = c("a", "b", "c"))
+dat
+as.data.frame(dat)
+```
+
+
+## Install P4 packages and dependencies
+
+You will need to be connected to the maze VPN for this installation, and for
+subsequently accessing the database.
+
+If prompted "do you want to install from source" or "do you want to install
+dependencies", answer "y"
+
+```{r echo=TRUE, results='hide'}
+install.packages(c("scidb", "arrayop", "BurstMode", "biobank"),
+  repos = c("https://cran.rstudio.com/", "http://scidb.mazetx.com/p4_r_repo/"))
+```
+
+Test biobank installation:
+
+```{r echo=TRUE, results='hide'}
+library(biobank, warn.conflicts = F)
+bb <- connect(
+  host = "scidb.mazetx.com",
+  username = "your_username", # <- YOUR USERNAME HERE
+  password = rstudioapi::askForPassword()
+  # password = readline() # Use this instead if not running from RStudio
+)
+```
+
+```{r}
+bb$list_namespaces()
+```
+
+If you don't see the "UK_BIOBANK" namespace, contact maze_support@paradigm4.com
+to be added to the security group.
+
+```{r}
+bb$get_variants("UK_BIOBANK", chrom = 1, start = 1, end = 100000, fields = c("rsid", "maf"))
+```
+

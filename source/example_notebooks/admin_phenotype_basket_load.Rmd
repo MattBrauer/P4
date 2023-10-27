@@ -1,0 +1,71 @@
+---
+title: "Paradigm4 Training Notebook: Loading Phenotype Baskets"
+output: html_document
+---
+
+PARADIGM4 INC.
+
+This file is distributed along with the Paradigm4 Enterprise SciDB 
+distribution kit and may only be used with a valid Paradigm4 contract 
+and in accord with the terms and conditions specified by that contract.
+
+Copyright (C) 2010 - 2021 Paradigm4 Inc.
+All Rights Reserved.
+
+# 0. Connecting 
+```{r}
+library(biobank)
+```
+```{r}
+bb <- connect(
+  host = "127.0.0.1",
+  username = 'scidbadmin',                  #replace with your username
+  password = rstudioapi::askForPassword(), 
+  port = 8083,
+  protocol = "https")
+bb$namespace='UK_BIOBANK'
+```
+
+# 1. Loading a phenotype basket
+
+In this document, we'll walk through loading a phenotype basket - using the 46920_basket as an example.  You'll need write permissions to the namespace where you want to load the phenotype basket.
+
+# 1.1.  Unpack and convert phenotype basket download
+
+You'll need the ukbunpack and ukbconv utilities (https://biobank.ctsu.ox.ac.uk/showcase/download.cgi).  Replace paths below as appopriate.
+
+First you'll need to upack and decrypt the .enc file.  This will take a while for a "full" phenotype basket, but is fast for the small basket we're using here.
+```{r}
+system("cd /staging/46920_basket_2012493/; ~/ukbunpack ukb46920.enc k50314r46920.key")
+```
+
+Then you'll need to convert the file to text format.
+```{r}
+system("cd /staging/46920_basket_2012493/; ~/ukbconv ukb46920.enc_ukb txt")
+```
+
+# 1.2.  Load phenotype fields & encodings
+
+Load latest field dictionary and field encodings - important if the phenotype basket contains new fields, as 46920 did.
+
+```{r}
+bb$load_field_dictionary(namespace = 'UK_BIOBANK',
+                         overwrite_if_exists = T)
+```
+
+```{r}
+bb$load_encodings(namespace = 'UK_BIOBANK', overwrite_if_exists = T)
+```
+
+# 1.3.  Load phenotype basket into biobank
+
+```{r}
+bb$load_phenotype_basket(namespace = 'UK_BIOBANK',
+                         phenotype_set_name = 'UKBB_46920',  
+                         basket_file = '/staging/46920_basket_2012493/ukb46920.txt',
+                         update_icd_counts = F)
+```
+
+```{r}
+bb$list_phenotype_sets(namespace = "UK_BIOBANK")
+```

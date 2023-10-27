@@ -1,0 +1,339 @@
+---
+title: "Paradigm4 Training Notebook: Map Variant Lists (MVL)"
+output: html_document
+---
+
+PARADIGM4 INC.
+
+This file is distributed along with the Paradigm4 Enterprise SciDB 
+distribution kit and may only be used with a valid Paradigm4 contract 
+and in accord with the terms and conditions specified by that contract.
+
+Copyright (C) 2010 - 2021 Paradigm4 Inc.
+All Rights Reserved.
+
+# 0. Connecting 
+```{r}
+library(biobank)
+```
+
+```{r}
+bb <- connect(
+  host = "127.0.0.1",
+  username = 'your_username',                #<<--- replace with your username
+  password = rstudioapi::askForPassword(),
+  port = 8083,
+  protocol = "https"
+)
+bb$namespace='UK_BIOBANK'
+```
+
+Map-variant-lists (MVL) allows you to define a custom R function and execute it on the genotype data in parallel using the burst cluster. The function is executed on lists of variants, for example, as output by `bb$get_annotation_frame` - typically these are genes - executing once per list and returning one result object per list. You can pass extra data to the function using a special `args` list (up to ~2GB). 
+
+Generally the following equivalence holds. Given some function
+`func(args, list_label, g)`
+and some list of variants
+`vl`
+The result of:
+`bb$map_variant_lists(NAMESPACE, func=func, args=args, variant_lists=vl)`
+Is euqivalent to:
+```
+result = list()
+g = bb$get_genotypes(NAMESPACE, subset(vl, list_label==LABEL))
+result[[LABEL]] = f(args, LABEL, g)
+result
+```
+For each unique LABEL in vl.
+
+The advantage of using MVL is the speed of burst processing across many lists simultaneously. Typical use cases include Burden Tests and expensive calculations like LD. But the function generally could be any valid R routine.
+
+In this notebook we start by demonstrating with a simple example and then go on to execute a more realistic burden test.
+
+# 1. Simple example: gene-level AAF
+
+We can define a function that computes the alternate allele frequency (aaf) of each variant in the gene. May not be as interesting in practice but helps illustrate the example of evaluating lists of variants at a time.
+For use with `map_variant_lists`, the function must accept 3 arguments: 
+ 1. `args`: the context passed to the function (or an empty list)
+ 2. `list_label`: the name or identifier of this particular set of variants
+ 3. `g`: the genotype data
+The `list_label` is provided to the function in case the logic includes special cases for specific lists 
+
+```{r}
+gene_aaf = function(args, list_label, g) {
+  return(colMeans(g, na.rm=T)/2)
+}
+```
+
+Create a list of LoF PCSK9 variants
+```{r}
+pcsk9_variants = bb$get_annotation_frame(
+  'UKB_200K_WES', 
+  'VEP_LOFTEE_20210504',
+  SYMBOL = 'PCSK9',
+  LoF = c('HC'),
+  fields = c('SYMBOL', 'LoF')
+)
+pcsk9_variants
+```
+
+Extract the matrix for the whole list at once
+```{r}
+pcsk9_genotypes = bb$get_genotypes(namespace='UKB_200K_WES', variant_list = pcsk9_variants, format='dose_matrix')
+dim(pcsk9_genotypes)
+```
+
+Call the function
+```{r}
+gene_aaf(args=list(), list_label = 'ENSG00000169174', pcsk9_genotypes)
+```
+
+Get a larger list of variants for a few genes
+```{r}
+gene_panel = bb$get_annotation_frame(
+  'UKB_200K_WES', 
+  'VEP_LOFTEE_20210504',
+  SYMBOL = c('PCSK9', 'APOE', 'IL33', 'IL6', 'APOB', 'LDLR', 'FLG', 'MUC4'), 
+  LoF = c('HC'),
+  fields = c('SYMBOL', 'LoF')
+)
+nrow(gene_panel)
+table(gene_panel$SYMBOL)
+```
+
+The variants provided to the function must have a `list_label` field. Note it could technically come from any source. We can set the `list_label` to the same as gene symbol for a simple example:
+```{r}
+gene_panel$list_label = gene_panel$SYMBOL
+head(gene_panel)
+```
+
+Run in burst mode
+```{r}
+result = bb$map_variant_lists(
+  namespace = 'UKB_200K_WES',
+  func = gene_aaf,
+  args = list(),
+  variant_lists = gene_panel,
+  genotype_format = 'dose_matrix'
+)
+```
+
+Note: now the result is a list and the `names()` of it correspond to list labels
+```{r}
+result[['PCSK9']]
+```
+
+Note the computed PCSK9 list (not in MVL) matches exactly. When operating on probabilistic genotypes (UK_BIOBANK namespace) it is possible to see a slight deviation for variants with uncertainty. This is caused by the libraries that read BGEN files in slightly different ways.
+```{r}
+all.equal(
+  result[['PCSK9']],
+  gene_aaf(args=list(), list_label = 'PCSK9', pcsk9_genotypes)
+)
+```
+
+# 2. Advanced Example: Burden Test
+
+We'll define and run a burden test using a small number of phenotypes and covariates. We'll restrict the population to British, Unrelated and use the covariates Age, Sex, and genetic principal components 1-10:
+```{r}
+covariate_fields = c('age', 'sex', paste0('pcomp_', c(1:10)))
+covariate_data = bb$get_phenotype_data(  
+  namespace='UK_BIOBANK',
+  phenotype_set = 'WHITE_BRITISH_UNRELATED_COVARIATES', 
+  title = covariate_fields,
+  value_cast = 'double')
+covariate_data = reshape2::dcast(covariate_data, eid ~ title)
+head(covariate_data)
+```
+               
+We'll use the previously-constructed EXAMPLE_GWAS_CATEGORICAL_PHENOS set and select 4 phenotypes. We create a data frame with these phenotypes. 
+```{r}
+phenotype_fields = c('icd10_alzheimers',
+                     'icd10_asthma',
+                     'icd10_hypertension',
+                     'sr_high_cholesterol')
+phenotype_data = bb$get_phenotype_data(
+  namespace = 'UK_BIOBANK', 
+  phenotype_set = 'EXAMPLE_GWAS_CATEGORICAL_PHENOS',
+  title = phenotype_fields,
+  value_cast = 'double')
+phenotype_data = reshape2::dcast(phenotype_data, eid ~ title)
+phenotype_data
+```
+
+We can add a "custom asthma" phenotype by combining ICD10 J459 from field 41270 and self-reported asthma from 20002
+```{r}
+asthma_j459 = bb$get_phenotype_data(
+  namespace = 'UK_BIOBANK', 
+  phenotype_set = 'UKBB_45561',
+  field_id = 41270,
+  value = 'J459'
+)
+
+#see https://biobank.ndph.ox.ac.uk/ukb/coding.cgi?id=6
+asthma_sr  = bb$get_phenotype_data(
+  namespace = 'UK_BIOBANK', 
+  phenotype_set = 'UKBB_45561',
+  field_id = 20002,
+  value = '1111'
+)
+
+phenotype_data$asthma_custom = 0
+phenotype_data$asthma_custom[ phenotype_data$eid %in% asthma_j459$eid] = 1
+phenotype_data$asthma_custom[ phenotype_data$eid %in% asthma_sr$eid] = 1
+
+phenotype_fields = c(phenotype_fields, 'asthma_custom')
+phenotype_data
+```
+
+Merge and check the phenotypes for `NA`. In practice, the phenotypes can contain `NA` values but covariates should not.
+This also has the effect of subsetting the phenotypes to the white/british/unrelated population
+```{r}
+phenotype_frame = merge(phenotype_data, covariate_data)
+any(is.na(phenotype_frame))
+```
+
+We'll construct our `args` list with the frame, the names of the phenotypes and the names of the covariates
+```{r}
+args = list( phenotype_fields = phenotype_fields,
+             covariate_fields = covariate_fields,
+             phenotype_frame = phenotype_frame)
+```
+
+We define an example burden test routine, algorithm adapted from EPACTS. See https://genome.sph.umich.edu/wiki/EPACTS
+```{r}
+example_burden_test <- function(args, list_label, genotypes)
+{
+  #Algorithm adapted from 
+  #https://github.com/statgen/EPACTS/blob/master/data/group.b.collapse.R
+  #Unpack args to get the phenotypes and covariates
+  phenotype_frame = args$phenotype_frame
+  phenotype_fields = args$phenotype_fields
+  covariate_fields = args$covariate_fields
+  
+  #Subset the genotypes to only individuals in the frame
+  genotypes = genotypes[ rownames(genotypes) %in% phenotype_frame$eid, , drop=F]
+  
+  #For genotypes whose aaf is greater than 0.5 (alternate is major), flip them. 
+  aaf = colMeans(genotypes, na.rm=T)
+  aaf[is.nan(aaf)] = 0
+  for ( i in 1:length(aaf)) {
+    if(aaf[i] > 0.5) {
+      genotypes[,i] = 2-genotypes[,i]
+    }
+  }
+  
+  #Collapse gneotypes. There are many interesting ways to do this in the literature
+  collapsed = rowSums(genotypes,na.rm=T) 
+  collapsed[ collapsed>0 ] = 1
+  geno_frame = data.frame(eid = names(collapsed), geno = collapsed )
+  reg_frame = merge(phenotype_frame, geno_frame)
+  
+  #Stop if all genotypes are 0 
+  if(all(reg_frame$geno == 0)) {
+    stop("No nonreference genotypes present in the selected population")
+  }
+  
+  #For each phenotype, compute the GLM
+  result = data.frame()
+  for(phenotype in phenotype_fields) {
+    formula_str = paste0(phenotype, ' ~ geno + ', paste0(covariate_fields, collapse=' + '))
+    regression_result <- glm(reg_frame, formula = formula_str, family=binomial)
+    regression_result = summary(regression_result)$coefficients['geno',]
+    result = rbind(result, data.frame( list_label = list_label,
+                                       phenotype = phenotype,
+                                       pvalue = regression_result['Pr(>|z|)'], 
+                                       beta = regression_result['Estimate'],
+                                       z = regression_result['z value'],
+                                       se = regression_result['Std. Error'],
+                                       stringsAsFactors = F
+                                       ))  
+  }
+  rownames(result) = NULL
+  return(result)
+}
+```
+
+Test the function locally using PCSK9
+```{r}
+genotypes = bb$get_genotypes(
+  namespace='UKB_200K_WES', 
+  variant_list = subset(gene_panel, list_label =='PCSK9'),
+  format='dose_matrix'
+)
+dim(genotypes)
+```
+
+We see significant association with high cholesterol.
+```{r}
+example_burden_test(args, 'PCSK9', genotypes)
+```
+
+Now run the function in burst mode on all the genes in `gene_panel`. This takes a few seconds:
+```{r}
+burden_result = bb$map_variant_lists(
+                     namespace = 'UKB_200K_WES',
+                     variant_lists = gene_panel,
+                     func = example_burden_test,
+                     args = args,
+                     genotype_format = 'dose_matrix' 
+                    )
+```
+
+```{r}
+r = burden_result[ which(sapply(burden_result, class) == 'data.frame') ]
+r = data.table::rbindlist(r)
+```
+
+Did anything not come back as a data.frame? These might be errors:
+```{r}
+burden_result[ which(sapply(burden_result, class) != 'data.frame') ]
+```
+
+```{r}
+r[order(r$pvalue), ]
+```
+
+# 3. Run on a full panel of LOFs
+
+Let's extract everything that's 'LoF=HC' 
+```{r}
+full_panel = bb$get_annotation_frame(
+  'UKB_200K_WES', 
+  'VEP_LOFTEE_20210504',
+  chrom = c(1:22),      #NOTE: MVL does not fully support chrom 23 at the moment
+  LoF = c('HC'),
+  fields = c('SYMBOL', 'LoF')
+)
+```
+
+This runs in about 20 minutes and costs about $5
+```{r}
+full_burden_result = bb$map_variant_lists(
+                     namespace = 'UKB_200K_WES',
+                     variant_lists = full_panel,
+                     func = example_burden_test,
+                     args = args,
+                     genotype_format = 'dose_matrix'
+                    )
+```
+
+A few top hits:
+         list_label           phenotype       pvalue       beta         z         se
+ 1: ENSG00000180228       asthma_custom 5.776061e-11  0.1132926  6.549421 0.01729810
+ 2: ENSG00000180228        icd10_asthma 1.837798e-09  0.1370614  6.011531 0.02279976
+ 3: ENSG00000130164 sr_high_cholesterol 2.167550e-09  1.9212671  5.984726 0.32102843
+ 4: ENSG00000073605       asthma_custom 4.221118e-09  0.1109058  5.875287 0.01887665
+ 5: ENSG00000179344       asthma_custom 9.857457e-09 -0.1199320 -5.733163 0.02091899
+ 6: ENSG00000084710    icd10_alzheimers 3.676955e-07  3.9296485  5.084964 0.77279768
+ 7: ENSG00000066735    icd10_alzheimers 4.344662e-07  3.8918390  5.053201 0.77017300
+ 8: ENSG00000163631 sr_high_cholesterol 4.892615e-07  1.4810621  5.030477 0.29441784
+ 9: ENSG00000204290       asthma_custom 5.959659e-07 -0.1274651 -4.992520 0.02553121
+10: ENSG00000114737    icd10_alzheimers 9.081138e-07  3.7955228  4.910571 0.77292895
+```{r}
+rr = full_burden_result[ which(sapply(full_burden_result, class) == 'data.frame') ]
+rr = data.table::rbindlist(rr)
+rr[order(rr$pvalue), ]
+```
+
+# Notes:
+
+We have prototyped a yet-unreleased method to run MVL on a stored phenotype set with thousands of phenotypes (PheWAS style). Let us know if you need assistance or would like to test it out. Write to us at maze_support@paradigm4.com

@@ -1,0 +1,177 @@
+---
+title: "Paradigm4 Training Notebook: Loading Association Data"
+output: html_document
+---
+
+PARADIGM4 INC.
+
+This file is distributed along with the Paradigm4 Enterprise SciDB 
+distribution kit and may only be used with a valid Paradigm4 contract 
+and in accord with the terms and conditions specified by that contract.
+
+Copyright (C) 2010 - 2021 Paradigm4 Inc.
+All Rights Reserved.
+
+# Connecting
+```{r}
+library(biobank)
+library(scidb)
+bb <- connect(
+  host = "127.0.0.1",
+  username = 'scidbadmin',                  #replace with your username
+  password = rstudioapi::askForPassword(), 
+  port = 8083,
+  protocol = "https")
+db = bb$db
+```
+
+# Download some Rivas data
+Download some of the Rivas data if not already present
+```{r}
+system(paste0(
+"mkdir -p /staging/load_rivas ; ",
+"pushd /staging/load_rivas ; ",
+"wget https://github.com/rivas-lab/public-resources/raw/master/uk_biobank/summary_stats/column_descripitions ; ",
+"wget https://github.com/rivas-lab/public-resources/raw/master/uk_biobank/summary_stats/icds.sorted.part12.tsv.gz ; ",
+"wget https://github.com/rivas-lab/public-resources/raw/master/uk_biobank/summary_stats/icdinfo.txt"
+))
+```
+
+Get the list of all the unique traits
+```{r}
+system(paste0(
+  'pushd /staging/load_rivas ; ',
+  'zcat icds.sorted.part12.tsv.gz | awk \'{print $1}\' | uniq | sort | uniq >> unique_icds_12.txt'
+))
+```
+
+```{r}
+unique_codes_12 = data.table::fread('/staging/load_rivas/unique_icds_12.txt', header = F)
+colnames(unique_codes_12) = c('pheno_code')
+unique_codes_12 = unique(unique_codes_12)
+unique_codes_12
+```
+
+# Get the descriptions for those fields
+```{r}
+descriptions = data.table::fread('/staging/load_rivas/icdinfo.txt')
+colnames(descriptions) = c('pheno_code', 'nobs', 'desc', 'x', 'y', 'z')
+descriptions = descriptions[,c('pheno_code', 'nobs', 'desc')]
+descriptions = subset(descriptions, pheno_code %in% unique_codes_12$pheno_code)
+descriptions
+```
+```{r}
+descriptions$title = paste0(
+  descriptions$pheno_code, '_', 
+  tolower(gsub('_$', '', gsub('_+', '_', gsub('[()/,;+-]', '_', descriptions$desc))))
+)
+```
+
+```{r}
+descriptions$description = paste0(descriptions$desc, ': ', descriptions$nobs, ' observations')
+```
+
+```{r}
+descriptions$notes = 'Computed using PLINK by Rivas Lab; uploaded by Paradigm4 from https://github.com/rivas-lab/public-resources/blob/master/uk_biobank/summary_stats'
+```
+
+```{r}
+descriptions$value_type = 'Categorical (single)'
+descriptions$value_type[grepl('INI', descriptions$pheno_code)] = 'Continuous'
+descriptions$value_type[grepl('BROADQT', descriptions$pheno_code)] = 'Continuous'
+descriptions
+```
+
+# Create the association set
+```{r}
+bb$delete_association_set(namespace = "public", association_set = "DEMO_RIVAS_PUBLIC_DATA")
+```
+
+First, we'll create the association set (in the public namespace, but linked to the UK_BIOBANK namespace for variant data).  Note that initially, we're initializing the association set using only 10 of the 19 phenotypes from the Rivas subset
+```{r}
+bb$create_association_set(
+  namespace = 'public', 
+  association_set_name = 'DEMO_RIVAS_PUBLIC_DATA', 
+  phenotypes = data.frame(
+    descriptions[1:10, c('title', 'description', 'value_type', 'notes')]
+  ),
+  variant_namespace = 'UK_BIOBANK'
+)
+```
+
+We can see the phenotype fields we created the association set with.
+```{r}
+bb$get_phenotype_fields('public', association_set =  'DEMO_RIVAS_PUBLIC_DATA')
+```
+We can also get the list of variants associated with the association set.  This will be empty, since we did not initialize the association set with any variants using its "variants" argument.
+```{r}
+bb$get_variants(namespace = "public", association_set = "DEMO_RIVAS_PUBLIC_DATA")
+```
+
+```{r}
+bb$list_association_sets(namespace = "public")
+```
+# Upload Association Data
+
+Now we can read the Rivas subset.  For upload_association data, we need a data frame containing variant identification columns ('chrom', 'pos', 'ref', and 'alt'), a 'phenotype' (or 'title') column, and the value fields ('pvalue', 'beta', 'se', 'nobs', 'note')
+
+```{r}
+part = 12
+print(paste0(">>>>>> ", part))
+x = data.table::fread(cmd = paste0('zcat /staging/load_rivas/icds.sorted.part', part, '.tsv.gz'))
+colnames(x) = c('pheno_code', 'chrom', 'pos', 'pvalue', 'beta', 'se')
+x$cp = paste0(x$pheno_code, ':', x$chrom, ':', x$pos)
+x
+```
+
+Take only the first instance of a pheno_code / chrom / pos combination
+```{r}
+x$cpd = duplicated(x$cp)
+bad_cp = subset(x, cpd)$cp
+x = subset(x, !cp %in% bad_cp)
+x
+```
+Set the title, nobs, and note fields
+```{r}
+x = merge(x, descriptions[, c('pheno_code', 'title')], by = 'pheno_code')
+x$nobs = NA
+x$note = ''
+x
+```
+
+The Rivas data doesn't contain ref or alt columns, so we'll need to add them by querying the UK_BIOBANK variants.  This will also remove any variants that aren't in the UK_BIOBANK namespace's variants.
+
+We'll also filter to a single chromosome here.
+
+```{r}
+vars_22 = bb$get_variants(namespace = "UK_BIOBANK", chromosome = 22)
+xx = merge(x, vars_22, by =c('chrom', 'pos'))
+xx
+```
+
+Now we can upload the data.   Note the allow_new_variants=T and allow_new_phenotypes=T arguments
+
+allow_new_variants=T allows the addition of variants that are not already in the association set.  When we created this association set, we could've specified a list of variants to initialize the set with.  Since we did not, all the variants we're uploading now are 'new'.  
+
+allow_new_phenotypes=T similarly allows the addition of new phenotypes.  Since we specifically initialized the association set with only 10 of the 19 phenotypes in this subset, 9 of them are 'new'.  
+
+``` {r}
+bb$upload_association_data(
+  namespace='public', 
+  association_set = 'DEMO_RIVAS_PUBLIC_DATA', 
+  data = data.frame(xx)[, c('title', 'chrom', 'pos', 'ref', 'alt', 'pvalue', 'beta', 'se', 'nobs', 'note')], 
+  allow_new_variants = T, 
+  allow_new_phenotypes = T,
+  verbose = T
+)
+```
+
+We can see the 'new' phenotypes have been added.  Note that phenotypes added this way have NA for value_type and description
+```{r}
+bb$get_phenotype_fields('public', association_set =  'DEMO_RIVAS_PUBLIC_DATA')
+```
+
+We can also see the updated set of variants in the association set.
+```{r}
+bb$get_variants(namespace = "public", association_set = "DEMO_RIVAS_PUBLIC_DATA")
+```

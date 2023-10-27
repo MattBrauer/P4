@@ -1,0 +1,231 @@
+---
+title: "Paradigm4 Training Notebook: Saige and Regenie Examples"
+output: html_document
+---
+
+PARADIGM4 INC.
+
+This file is distributed along with the Paradigm4 Enterprise SciDB 
+distribution kit and may only be used with a valid Paradigm4 contract 
+and in accord with the terms and conditions specified by that contract.
+
+Copyright (C) 2010 - 2021 Paradigm4 Inc.
+All Rights Reserved.
+
+# 0. Connecting
+```{r}
+library(biobank)
+```
+
+NOTE: Replace with your username and save a copy of this notebook to your home directory
+```{r}
+bb <- connect(
+  host = "127.0.0.1",
+  username = 'scidbadmin',
+  password = rstudioapi::askForPassword(),
+  port = 8083,
+  protocol = "https")
+bb$namespace='UK_BIOBANK'
+```
+
+
+# 1. Notes on Calculation and Performance
+
+The user provides the phenotype data, covariates, variant lists, and a few auxiliary options. SAIGE and SAIGE-Gene work as follows:
+ 1. For every phenotype not previously encountered, we compute the Step 1 null model and variance ratios
+ 2. Store Step 1 results for future reuse
+ 3. Compute Step 2 using Step 1 and the supplied variants 
+
+Step 1 takes a long time to calculate but burst mode helps parallelize it across workers. If you are using ~337,000 individuals (i.e. British unrelated) you may expect as long as as 2 hours or more per phenotype per machine. Burst mode executes different phenotypes on different machines in paralllel. To illustrate, suppose you select 25 phenotypes in one run, and it takes 2 hours per phenotype. You may see the following:
+ 1. burst mode launches 19 worker machines (current limit for Maze)
+ 2. workers take about 5 minutes to launch
+ 3. each worker takes 1 phenotype
+ 4. after ~2 hours, each worker has computed a phenotype. 6 phenotypes are remaining and are assigned to 6 workers. Other workers shut down.
+ 5. after 2 more hours the remaining 6 phenotypes finish.
+Thus the total time to run step 1 in this case would be 4 hours. 
+
+The estimate of "2 hours per phenotype" is also very approximate; real results will vary. In our tests we've seen anything from 30 minutes to 3+ hours, depending on the data and covariates. As soon as a worker finishes a task, it automatically takes on the next task from the queue.
+
+When subsetting the population to ~50,000 individuals, step 1 for a phenotype finishes in around 20 minutes. A lot of the examples in this notebook use such a subset to finish quicker.
+
+Step 2 is more predictable and tends to scale with the number of variants tested.
+
+REGENIE has a similar step 1 / step 2 process.
+
+## 1.1 Exceptional Scenarios
+
+If you are in the middle of a burst job and you lose connectivity, the job will run to completion behind the scenes. The results will be saved to a temporary location and we (Paradigm4) can retrieve them. More self-service functionality is on the way for cancelling or getting results from disconnected jobs.
+
+If any one task (step 1 phenotype or step 2 segment) does not finish in 12 hours, it is considered "failed" automatically. You can alter this timeout with the extra argument `max_task_runtime_secs` specified in seconds.
+
+If any tasks fail (running out of time or otherwise) their logs and error messages are returned at the end of the job.
+
+If you have any questions, write to us at maze_support@paradigm4.com
+
+# 2. Examples in UK_BIOBANK
+## 2.1 Starting with a Phenotype data.frame
+
+For this example, we'll input phenotype data using a phenotype data.frame.  Note that you can also use a previously stored phenotype set as detailed in 5. of the examples_first_training notebook.
+
+We'll pick two phenotypes. Note there is a new health-related outcome field for Asthma that may be of interest.  This field uses a "mix" of UKBB ICD10 hospital data and GP data. They have created a series of such fields, as 2-digit ICD10 codes. See https://biobank.ctsu.ox.ac.uk/crystal/field.cgi?id=131495
+
+We'll also use ICD10 for high cholesterol, and the previously-defined covariates for the White British subpopulation.
+
+```{r}
+asthma = bb$get_phenotype_data('UK_BIOBANK', 'UKBB_43361', field_id= 131495)
+asthma = unique(asthma$eid)
+asthma = data.frame(eid=asthma, asthma=1)
+hypercholesterolemia = bb$get_phenotype_data('UK_BIOBANK', 'UKBB_43361', field_id= 41270, value='E780')
+hypercholesterolemia = unique(hypercholesterolemia$eid)
+hypercholesterolemia = data.frame(eid=hypercholesterolemia, hypercholesterolemia=1)
+covariates = bb$get_phenotype_data(namespace = 'UK_BIOBANK', 'WHITE_BRITISH_UNRELATED_COVARIATES', 
+                                   title = c('age', 'sex', 'pcomp_1', 'pcomp_2', 'pcomp_3', 'pcomp_4'),
+                                   value_cast = 'double')
+covariates = reshape2::dcast(covariates, eid ~ title)
+pheno_frame_ukb = merge(covariates, hypercholesterolemia, all.x=T)
+pheno_frame_ukb = merge(pheno_frame_ukb, asthma, all.x=T)
+pheno_frame_ukb$hypercholesterolemia[is.na(pheno_frame_ukb$hypercholesterolemia)] = 0
+pheno_frame_ukb$asthma[is.na(pheno_frame_ukb$asthma)] = 0
+pheno_frame_ukb
+```
+
+## 1.2 Variants for UK_BIOBANK
+
+Select some variants.
+
+```{r}
+variants_ukb = bb$get_variants_in_genes(
+  namespace='UK_BIOBANK', 
+  gene_names =c('APOE', 'PCSK9', 'IL33', 'FLG'),
+  fields = c('ref', 'alt', 'maf', 'info_score')
+)
+variants_ukb
+```
+
+## 1.3 Subset pheno frame
+
+Here we'll randomly select 50,000 rows from the frame. This will subset our analysis. We do this for two reasons:
+ 1. We want to give users a sense of how Step 1 works. Random sampling ensures we don't have Step 1 already pre-computed for this set.
+ 2. We want a demo that finishes reasonably quickly as running Step 1 on the whole 337K individuals may take over 1 hour
+ 
+So this subsetting is quite artificial and done for demo purposes - unless, of course, you're working with a specific sub-population of interest.
+
+```{r}
+set.seed(1)
+pheno_frame_ukb_sample = pheno_frame_ukb[ sample(1:nrow(pheno_frame_ukb), size = 50000), ]
+set.seed(Sys.time())
+pheno_frame_ukb_sample_random = pheno_frame_ukb[ sample(1:nrow(pheno_frame_ukb), size = 50000), ]
+```
+
+## 1.4 PLINK for UK_BIOBANK
+
+PLINK run for comparison purposes.  This small example should run in ~10 seconds and should not engage burst mode.
+
+```{r}
+plink_result_ukb = bb$run_association_job(
+  phenotype_frame = pheno_frame_ukb_sample,
+  covariate_columns = c('age', 'sex', 'pcomp_1', 'pcomp_2', 'pcomp_3', 'pcomp_4'),
+  
+  variant_namespace = 'UK_BIOBANK', 
+  variant_list = variants_ukb,
+  
+  method='plink',
+  
+  phenotype_na_replacement = 'remove'
+)
+plink_result_ukb[order(plink_result_ukb$pvalue), ]
+```
+
+## SAIGE
+
+Run SAIGE. In this form we specify which column in the `phenotype_frame` are covariates and the rest are assumed to be phenotypes (except `eid`). This will first compute Step 1 and then Step 2. The ETA is about 20-30 minutes, mostly spent in step 1. In this case the result is returned as a data.frame but you can also use `output_namespace=` and `output_association_set` to save the result to DB.
+
+```{r}
+saige_result_ukb = bb$run_association_job(
+  phenotype_frame = pheno_frame_ukb_sample_random,
+  covariate_columns = c('age', 'sex', 'pcomp_1', 'pcomp_2', 'pcomp_3', 'pcomp_4'),
+  
+  variant_namespace = 'UK_BIOBANK', 
+  variant_list = variants_ukb,
+  
+  method='saige',
+  
+  phenotype_na_replacement = 'remove'
+)
+saige_result_ukb[order(saige_result_ukb$pvalue), ]
+```
+
+## SAIGE with precomputed models
+
+Run SAIGE.  In this case, SAIGE step 1 has already been run for this specific combination of samples / phenotypes, so only Step 2 will need to be run.
+
+```{r}
+saige_result_ukb_precomputed = bb$run_association_job(
+  phenotype_frame = pheno_frame_ukb_sample,
+  covariate_columns = c('age', 'sex', 'pcomp_1', 'pcomp_2', 'pcomp_3', 'pcomp_4'),
+  
+  variant_namespace = 'UK_BIOBANK', 
+  variant_list = variants_ukb,
+  
+  method='saige',
+  
+  phenotype_na_replacement = 'remove'
+)
+saige_result_ukb_precomputed[order(saige_result_ukb_precomputed$pvalue), ]
+```
+
+## Regenie
+
+Run Regenie.  In this case, Regenie step 1 has already been run for this specific combination of samples / phenotypes, so only Step 2 will need to be run.  If run on the random subset, Step 1 will (almost certainly) not have been previously run, in which case you can expect a single Step 1 task with a runtime of ~40 minutes.
+
+```{r}
+regenie_result_ukb_precomputed = bb$run_association_job(
+  phenotype_frame = pheno_frame_ukb_sample,
+  covariate_columns = c('age', 'sex', 'pcomp_1', 'pcomp_2', 'pcomp_3', 'pcomp_4'),
+  
+  variant_namespace = 'UK_BIOBANK', 
+  variant_list = variants_ukb,
+  
+  method='regenie',
+  
+  phenotype_na_replacement = 'remove'
+)
+regenie_result_ukb_precomputed[order(regenie_result_ukb_precomputed$pvalue), ]
+```
+
+# 3.1 Larger SAIGE run
+
+Here we'll run a larger SAIGE GWAS - with four phenotypes and all individuals in the White British subpopulation, though we'll continue to use the ~1200 variants previously selected.
+
+```{r}
+pheno_frame_larger = pheno_frame_ukb
+eids_filter <- unique(
+bb$get_phenotype_data(namespace='UK_BIOBANK', phenotype_set = "UKBB_43361", field_id = c(41202, 41204), value_prefix = "E78")["eid"])
+eids_filter$high_cholesterol_e78 <- 1
+pheno_frame_larger <- merge(x = pheno_frame_larger, y = eids_filter, all.x = TRUE)
+eids_filter <- unique(
+bb$get_phenotype_data(namespace='UK_BIOBANK', phenotype_set = "UKBB_43361", field_id = c(41202,41204), value_prefix = "I21")["eid"])
+eids_filter$heart_attack_i21 <- 1
+pheno_frame_larger <- merge(x = pheno_frame_larger, y = eids_filter, all.x = TRUE)
+pheno_frame_larger
+```
+
+This particular SAIGE GWAS has also previously been run, so you won't see burst-mode engage.  However, you can use the step1_build="all" argument, which will force SAIGE to build step 1 models even if they previously existed.
+
+If you do so, running this SAIGE job will spawn four tasks in Step 1, 1 for each phenotype. You should see all four of these tasks move to "in-progress" once burst workers are brought online.  Computing Step 1 models for each phenotype will take approximately two hours, for a total runtime of approximately two hours, and will cost approximately ~$10 to run (dependant on AWS Spot Instance pricing at the time).
+
+```{r}
+saige_result_ukb_larger = bb$run_association_job(
+  phenotype_frame = pheno_frame_larger,
+  covariate_columns = c('age', 'sex', 'pcomp_1', 'pcomp_2', 'pcomp_3', 'pcomp_4'),
+  
+  variant_namespace = 'UK_BIOBANK', 
+  variant_list = variants_ukb,
+  
+  method='saige',
+  
+  phenotype_na_replacement = 0
+  #, step1_build="all"
+)
+saige_result_ukb_larger[order(saige_result_ukb_larger$pvalue), ]
+```

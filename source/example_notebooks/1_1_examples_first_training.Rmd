@@ -1,0 +1,627 @@
+---
+title: "Paradigm4 Training Notebook: Initial Examples"
+output: html_document
+---
+
+PARADIGM4 INC.
+
+This file is distributed along with the Paradigm4 Enterprise SciDB 
+distribution kit and may only be used with a valid Paradigm4 contract 
+and in accord with the terms and conditions specified by that contract.
+
+Copyright (C) 2010 - 2021 Paradigm4 Inc.
+All Rights Reserved.
+
+Update: 20201130 - new version of biobank forbids phenotype field titles with '.' in the name. Adjusted our ALL_ sets accordingly.
+
+# 0. Connecting
+```{r}
+library(biobank)
+```
+
+NOTE: Replace with your username and save a copy of this notebook to your home directory
+```{r}
+bb <- connect(
+  host = "127.0.0.1",
+  username = 'scidbadmin',
+  password = rstudioapi::askForPassword(),
+  port = 8083,
+  protocol = "https")
+bb$namespace='UK_BIOBANK'
+```
+
+## 0.1 Getting Help
+
+Standard R package help is available. Because `biobank` is a Class, the per-function documentation pages are named with a "biobank_" prefix. Use the "index" link to get a list of available methods
+```{r}
+?biobank_list_namespaces
+```
+
+# 1. Basic Phenotype Queries
+
+Biobank queries return R data.frame objects.
+
+## 1.1 Listing Namespaces
+
+A namespace contains
+ * a population of people (which may overlap with other namespaces)
+ * 0 or more phenotype sets
+ * 0 or more association sets
+ * 0 or more variants with annotations and genotype data
+ 
+The output of this function varies by user. Admins can hide certain namespaces from certain users. Also, it is possible for users to have read but not write access to a namespace.
+```{r}
+bb$list_namespaces()
+```
+
+## 1.2 Listing Phenotype Sets in a Namespace
+
+A phenotype set contains 
+ * 1 or more individuals (a subset of the namespace participants)
+ * 0 or more fields (that store data across the participants sparsely)
+
+Phenotype sets can be created a Biobank basket load (raw) or they can be user-created (derived). The fields in a phenotype set can be nested hierarchically. Currently we only use nested fields for the raw sets.
+
+The set `UKBB_43361` was created from a load of your UK Biobank basket (partial, to be updated). 43361 is the "basket number". The other sets are derived from it by selecting specific fields and converting them to phenotypes - similar to PHESANT; to be discussed later.
+```{r}
+bb$list_phenotype_sets(namespace = 'UK_BIOBANK')
+```
+
+## 1.3 Listing the fields of a Phenotype Set
+
+By default, `get_phenotype_fields` returns the top-level field hierarchy. 
+
+The "value_type" column is taken from the UKBB schema. Note we store all the data as strings internally but can cast to other types at query time.
+
+The columns "number_of_participants" and "value_count" show how many non-empty values there are, across all subfields. These numbers can differ when a field has sub-fields and participants have multiple values across sub-fields.
+
+The columns instance/index_min/max show how many sub-fields each field has, mimicking the Biobank schema. 
+
+The "description" of the field is the UKBB URL for its summary page. The "notes" are taken from the UKBB schema. 
+```{r}
+bb$get_phenotype_fields(namespace = 'UK_BIOBANK', phenotype_set = 'UKBB_43361')
+```
+
+Setting `expand=T` returns data for each sub-field separately. Note the `number_of_participants` column is now useful to determine which sub-fields are populated with data.
+```{r}
+bb$get_phenotype_fields(namespace = 'UK_BIOBANK', phenotype_set = 'UKBB_43361', expand = T)
+```
+
+You can search fields by keyword, case insensitive:
+```{r}
+bb$get_phenotype_fields(namespace = 'UK_BIOBANK', phenotype_set='UKBB_43361', name_kw = 'weight', expand = T)
+```
+
+## 1.4 Querying Phenotype Data
+You can retrieve data for combinations of eids / field_ids. Optionally, index and instance can be specified. We'll retrieve data for field Weight (21002), instance 0
+```{r}
+weight = bb$get_phenotype_data(namespace = 'UK_BIOBANK', phenotype_set = "UKBB_43361", 
+                               field_id = 21002, instance = 0)
+weight
+```
+
+Note the previous call returned data as a "character" type. This is a catch-all that works for all fields (diagnoses, dates, notes...). To return the data as numeric, use value_cast to convert. Currently, "double" and "float" are supported
+```{r}
+weight = bb$get_phenotype_data(phenotype_set = "UKBB_43361", 
+                               field_id = 21002, instance = 0, 
+                               value_cast = 'double')
+weight
+```
+
+```{r}
+hist(weight$value, breaks=100, col='blue')
+```
+
+## 1.4 Phenotype Data Filtering
+The argument `value_range` applies a range condition (inclusive) while `NA` means "no upper bound"
+```{r}
+weight_over_80 = bb$get_phenotype_data(phenotype_set = "UKBB_43361", 
+                                       field_id = 21002, instance = 0, 
+                                       value_range=c(80, NA), 
+                                       value_cast = 'double')
+weight_over_80
+```
+
+Similarly we can select weight between 80 and 100. At these sizes, this kind of subsetting is easy to do R in as well, but it comes in handy with other fields that contain lots of values. More examples coming up.
+```{r}
+bb$get_phenotype_data(phenotype_set = "UKBB_43361", 
+                                       field_id = 21002, instance = 0, 
+                                       value_range=c(80, 100), 
+                                       value_cast = 'double')
+```
+
+## 1.5 ICD Codes
+
+These tend to be important for gwas analysis and we created additional dictionary lookups for them. We first go over a few helper methods to lookup codes and meanings
+
+The argument "name=" (second poistional) does a keyword lookup (case insensitive). We also return the number of diagnoses for each code and sub-code. Note these are the numbers of diagnoses, not the numbers of individuals, but they are a good proxy. The column "count_primary" is generated from field 41202 whereas "count_secondary" is generated from 41204
+```{r}
+bb$get_icd10(namespace = 'UK_BIOBANK', 'heart')
+```
+
+The argument `code` maps a particular code to its meaning.
+Note that I20 is a "superset" code. Nobody is diagnosed with "I20" but many are diagnosed with its sub-codes.
+```{r}
+bb$get_icd10(namespace = 'UK_BIOBANK', code = 'I20')
+```
+
+The argument `expand` retrieves all the sub-codes:
+```{r}
+bb$get_icd10(namespace = 'UK_BIOBANK', code = 'I20', expand=T)
+```
+
+Note the names are not always intuitive or fully-descriptive:
+```{r}
+bb$get_icd10(namespace = 'UK_BIOBANK', 'diabetes', expand=T)
+```
+
+The same framework is in place for ICD9 however those are less frequently used in UKBB:
+```{r}
+bb$get_icd9(namespace = 'UK_BIOBANK', 'diabetes', expand=T)
+```
+
+## 1.6 Retrieving ICD10 codes and advanced filtering
+
+We can use `value_prefix` to retrieve all the cases of code `I20` and it's children from fields 41202 and 41204. Note the use of two fields in the same query:
+```{r}
+icd10_I20 = bb$get_phenotype_data(phenotype_set = "UKBB_43361", field_id =c(41202,41204), value_prefix='I20')
+icd10_I20
+```
+
+```{r}
+table(icd10_I20$field_id)
+```
+
+Note the match
+```{r}
+bb$get_icd10(namespace = 'UK_BIOBANK', code = 'I20')
+```
+
+We can also specify multiple prefixes
+```{r}
+icd10_I20_I21 = bb$get_phenotype_data(namespace = 'UK_BIOBANK',
+                                      phenotype_set = "UKBB_43361", 
+                                      field_id =c(41202,41204), 
+                                      value_prefix=c('I20', 'I21'))
+icd10_I20_I21
+```
+
+Or an exact match using `value=`
+```{r}
+bb$get_phenotype_data(namespace = 'UK_BIOBANK', phenotype_set = "UKBB_43361",  field_id =c(41202,41204), value='I209')
+```
+
+We can also use `eid` to select only from individuals in a specific list. The below selects all individuals with weight over 80 (from a previous result) and ICD10 code of I209:
+```{r}
+bb$get_phenotype_data(namespace = 'UK_BIOBANK', 
+                      phenotype_set = "UKBB_43361",  
+                      field_id =c(41202,41204), 
+                      value='I209',
+                      eid = weight_over_80$eid)
+```
+
+
+## 1.7 Querying By Individuals and Encodings
+
+You can omit the `field_id` argument and supply only the `eid` to get all the information for a particular individual:
+```{r}
+individual_data= bb$get_phenotype_data(phenotype_set = "UKBB_43361", eid = c(1265841, 4471607))
+individual_data
+```
+
+Note however that many of the above values are "encoded" using UKBB encodings. We can interpolate them using the encoding schema. These include medications, operations, and even ICD10:
+```{r}
+all_encodings = bb$get_encoding(namespace = 'UK_BIOBANK')
+all_encodings
+```
+
+We can create an "encoding map" and join it to the data for the invidual
+```{r}
+all_fields = bb$get_phenotype_fields(namespace = 'UK_BIOBANK', phenotype_set = 'UKBB_43361')
+encoding_map= merge(all_fields, all_encodings)[c('field_id', 'value', 'meaning')]
+encoding_map
+```
+
+This allows us to look into a detailed profile for a particular individual:
+```{r}
+individual_data = merge(individual_data, encoding_map, all.x=T)
+individual_data[c('eid', 'field_id', 'title', 'instance', 'index', 'value', 'meaning')]
+```
+
+
+# 2. Variant and Genotype Queries
+
+# 2.1 Variant Fields
+Recall from list_namespaces() that UK_BIOBANK contains ~93 million variants in HG19. 
+```{r}
+bb$list_namespaces()
+```
+
+All the variant loci are annotated with fields that can be filtered by. The set of fields can be added over time. The fields themselves are annotated with their origin. 
+```{r}
+bb$get_variant_fields(namespace = 'UK_BIOBANK')
+```
+
+We plan to update / replace some of these with your choices as our project proceeds.
+
+## 2.2 Querying Variants
+
+The loci themselves can be queried by any combination of fiels. By default, only the fields marked `output_optional=F` are returned:
+```{r}
+bb$get_variants(namespace = 'UK_BIOBANK', chromosome = 1, start = 1000000, end = 1500000)
+```
+
+You can specify which fields you'd like to retrieve by supplying `fields=`. Note that `chrom`, `pos`, `ref` and `alt` are always returned:
+```{r}
+bb$get_variants(namespace = 'UK_BIOBANK', chromosome = 1, start = 1000000, end = 1500000, fields = c('maf', 'info_score'))
+```
+
+
+## 2.4 Querying Variants by Fields
+
+Similar to `get_phenotype_data`, exact equality or range conditions can be used to filter variants on any of the fields
+```{r}
+bb$get_variants(namespace = 'UK_BIOBANK', 
+                chromosome = 1, start = 1000000, end = 1500000, 
+                maf_range = c(0, 0.1),
+                info_score_range = c(0.8, NA),
+                all_annotations = T)
+```
+
+## 2.5 Genes
+
+We've loaded a HG19 gene list from NCBI. Gene annotations themselves can be queried. The gene fields themselves can also be customized
+```{r}
+bb$get_genes(namespace='UK_BIOBANK', gene_name='PTEN')
+```
+
+By default the gene search uses exact match. Set to FALSE to use regular expression match
+```{r}
+bb$get_genes(namespace='UK_BIOBANK', gene_name='pten', exact_match = F)
+```
+
+In most cases, the whole gene list itself is small enough to be downloadable fully:
+```{r}
+all_genes = bb$get_genes(namespace='UK_BIOBANK')
+all_genes
+```
+
+## 2.6 Querying Variants by Genes
+
+Note - when querying variants with the `gene=` we use the start, end ranges from the `get_genes` output. 
+```{r}
+bb$get_variants(namespace='UK_BIOBANK', gene='PCSK9',
+                fields = c('maf', 'info_score'))
+```
+
+When querying for multiple genes, it's best to use `get_variants_in_genes` as it will return duplicated variants in genes that are overlap
+```{r}
+bb$get_variants_in_genes(
+  namespace='UK_BIOBANK', 
+  gene_names =c('PCSK9', 'KRAS', 'PTEN'),
+  fields = c('ref', 'alt', 'maf', 'info_score')
+)
+```
+
+Now try the same query in the UKB_200K_WES namespace
+```{r}
+bb$get_variants_in_genes(
+  namespace='UKB_200K_WES', 
+  gene_names =c('PCSK9', 'KRAS', 'PTEN'),
+  fields=c('ref', 'alt', 'maf', 'missing')
+)
+```
+
+
+## 2.8 Querying genotypes
+
+Use `get_genotypes` to pull out individual-level genotype data. Note that this data is quite large and you may run into the transfer limit. We provided several options for querying, some of which mitigate the size impact.
+
+First, you can supply a chromosome and position. The default result is a data.frame with bgen-style probabilities. Such that:
+
+ * p_rr is the probability of having homozygous reference 
+ * p_ar is the probability of having heterozygous
+ * p_ar is the probability of having homozygous alternate
+ 
+Each probability is a floating point between 0 and 1. `NA` are returned for missing genotypes:
+```{r}
+bb$get_genotypes(chrom=10, pos=89603424)
+```
+
+The flag `nonref_only` returns genotypes that are non-reference (including NA and fractional probabilities):
+```{r}
+bb$get_genotypes(chrom=10, pos=89603424, nonref_only = T)
+```
+
+Instead of supplying a chromosome and position, you can supply a variant list output by get_variants
+```{r}
+pcsk9_vars = bb$get_variants(namespace = 'UK_BIOBANK', gene = 'PCSK9',  info_score=1)
+pcsk9_vars
+```
+
+```{r}
+bb$get_genotypes(variant_list = pcsk9_vars, nonref_only = T)
+```
+
+You can use `eid` to supply a vector of individuals as well
+```{r}
+bb$get_genotypes(namespace = 'UK_BIOBANK', 
+                 variant_list = pcsk9_vars, 
+                 eid =c(1931038, 3404595, 4757705, 6012454),
+                 nonref_only=T)
+```
+
+The output format `dose_matrix` returns the result as an eid x genotype matrix:
+```{r}
+bb$get_genotypes(namespace = 'UK_BIOBANK',
+                 variant_list = pcsk9_vars, 
+                 eid =c(1931038, 3404595, 4757705, 6012454),
+                 format='dose_matrix')
+```
+
+The argument dose_matrix_cutoff can be used to convert an uncertain probability into NA - see documentation for get_genotypes.
+
+
+# 3. A small and quick GWAS on the spot 
+
+We follow a common workflow written up by Neale Lab. We first subset the population, convert it to a data frame of phenotype values and then compute some logistic regressions on it using plink. This workflow is too verbose and, in practice, we will usually use stored phenotype sets. But this demonstrates how we can compute association results from arbitrarily sourced data. In this case we will compute a (small) result and return it as a data.frame. We will cover persisting results later.
+
+
+## 3.1. Subpopulation filtering 
+This workflow starts with all the participants and slowly applies filters by different fields to shrink the list down.
+
+
+### 3.1.1. Remove Heterozygosity Outliers
+Note we use `value=NULL` to retrieve entries where the field is NOT populated
+```{r}
+all_participants = bb$get_participants(namespace='UK_BIOBANK')
+non_outliers <- bb$get_phenotype_data(namespace='UK_BIOBANK', 
+                                      phenotype_set = "UKBB_43361",
+                                      field_id = 22027, value = NULL)
+nrow(all_participants) - nrow(non_outliers)
+```
+
+```{r}
+eids = non_outliers['eid']
+nrow(eids)
+```
+
+### 3.1.2. Remove: “Submitted.Gender” != “Inferred.Gender”
+```{r}
+submitted_gender <- bb$get_phenotype_data(namespace='UK_BIOBANK', phenotype_set = "UKBB_43361", field_id = 31)[c("eid", "value")]
+inferred_gender <- bb$get_phenotype_data(namespace='UK_BIOBANK', phenotype_set = "UKBB_43361", field_id = 22001)[c("eid", "value")]
+eids_filter <- merge(submitted_gender, inferred_gender)["eid"]
+eids <- merge(eids, eids_filter)
+nrow(eids)
+```
+
+### 3.1.3 Remove: “Putative.sex.chromosome.aneuploidy” == 1
+```{r}
+eids_filter <- bb$get_phenotype_data(namespace='UK_BIOBANK', phenotype_set = "UKBB_43361", field_id = 22019, value=NULL)
+eids <- merge(eids, eids_filter)
+nrow(eids)
+```
+
+### 3.1.4. Subset to British White Ancestry
+```{r}
+eids_filter <- bb$get_phenotype_data(namespace='UK_BIOBANK', phenotype_set = "UKBB_43361", field_id = 22006, value_prefix = 1)["eid"]
+eids <- merge(eids, eids_filter)
+nrow(eids)
+```
+
+### 3.1.5. Remove relatives
+```{r}
+eids_filter <- bb$get_phenotype_data(namespace='UK_BIOBANK', phenotype_set = "UKBB_43361", field_id = 22020, value_prefix = 1)["eid"]
+eids <- merge(eids, eids_filter)
+nrow(eids)
+```
+
+### 3.1.6. Remove: “excluded.from.kinship.inference” ==1 and “excess.relatives” == 1
+```{r}
+eids_filter <- bb$get_phenotype_data(namespace='UK_BIOBANK', phenotype_set = "UKBB_43361", field_id = 22021, value = c(0, 1))["eid"]
+eids <- merge(eids, eids_filter)
+nrow(eids)
+```
+
+Thus we arrive at a "White British Unrelated" subpopulation.
+
+## 3.2. Add phenotypes
+
+We'll select a few categorical phenotypes and add them to as columns to this data frame
+
+### 3.2.1. High Cholesterol (code E78) and all of its sub-codes in 41202 and 41204
+```{r}
+eids_filter <- unique(
+bb$get_phenotype_data(namespace='UK_BIOBANK', phenotype_set = "UKBB_43361", field_id = c(41202, 41204), value_prefix = "E78")["eid"])
+eids_filter$high_cholesterol_e78 <- 1
+nrow(eids_filter)
+```
+
+Join it to our list of eids
+```{r}
+eids <- merge(x = eids,
+y = eids_filter,
+all.x = TRUE)
+eids =eids[,c("eid", "high_cholesterol_e78")]
+eids
+```
+
+```{r}
+nrow(subset(eids, high_cholesterol_e78==1))
+```
+
+### 3.2.3. Same for code I21 (Acute Myocardial Infarction)
+```{r}
+eids_filter <- unique(
+bb$get_phenotype_data(namespace='UK_BIOBANK', phenotype_set = "UKBB_43361", field_id = c(41202,41204), value_prefix = "I21")["eid"])
+eids_filter$heart_attack_i21 <- 1
+eids <- merge(x = eids, y = eids_filter, all.x = TRUE)
+eids
+```
+
+## 3.3. Add Covariates
+
+Again we add more columns for covariates
+
+### 3.3.1. Age at enrollment
+```{r}
+eids_filter <- bb$get_phenotype_data(namespace='UK_BIOBANK',phenotype_set = "UKBB_43361", 
+                                     field_id = 21022, value_cast='double')[c("eid", "value")]
+eids_filter$age <- eids_filter$value
+eids_filter$value <- NULL
+eids <- merge(x = eids, y = eids_filter, all.x = TRUE)
+eids
+```
+
+### 3.3.2. Sex
+```{r}
+eids_filter <- bb$get_phenotype_data(namespace='UK_BIOBANK', phenotype_set = "UKBB_43361", field_id = 31,
+                                     value_cast='double')[c("eid", "value")]
+eids_filter$sex <- eids_filter$value
+eids_filter$value <- NULL
+eids <- merge(x = eids, y = eids_filter, all.x = TRUE)
+eids
+```
+
+### 3.3.3. First 10 principal components
+Note we use the data.table function dcast to convert principal components to separate columns.
+```{r}
+eids_filter <- bb$get_phenotype_data(phenotype_set = "UKBB_43361", field_id = 22009,
+                                     index_range = c(1, 10), value_cast="float")
+eids_filter <- reshape2::dcast(eids_filter, eid ~ index)
+field_names <- names(eids_filter)
+names(eids_filter) <- c("eid", paste0("pcomp_", field_names[2:length(field_names)]))
+eids <- merge(x = eids, y = eids_filter, all.x = TRUE)
+eids
+```
+
+This will be a data frame we analyze
+```{r}
+was_phenos=eids
+was_phenos
+```
+
+## 3.4. Select some variants to analyze
+```{r}
+vars = bb$get_variants(namespace='UKB_200K_WES', gene='APOE', maf_range=c(0.0001,NA))
+vars[order(vars$pos), ]
+```
+
+## 3.5 Run the association job
+
+This function will perform the calculation and return the result as a data frame. We specify the covariate columns; everything else is considered a phenotype, other than "eid". The flag `phenotype_na_replacement=0` will convert all occurrences of `NA` in the phenotype columns to 0 for the purposes of the calculation. That is to say, "if you don't have a recorded diagnosis, we assume you do not have the phenotype." 
+
+Note the square nature of the problem: PHENOTYPES x VARIANTS = NUM_REGRESSIONS. It is easy for these calculations to become large.
+
+NOTE: as of this writing we only support method 'plink' and only on variant_namespace 'UKB_200K_WES'. Other options on the way as we install full burst capabilities
+```{r}
+association_result = bb$run_association_job(phenotype_frame = was_phenos,
+                                            variant_namespace = 'UKB_200K_WES',
+                                            variant_list = vars,
+                                            covariate_columns =c('age', 'sex', paste0('pcomp_', c(1:10))),
+                                            method = 'plink',
+                                            phenotype_na_replacement = 0,
+                                            plink_regression_arguments = 'firth-fallback --covar-variance-standardize')
+association_result[order(association_result$pvalue), ]
+```
+
+# 4. Linear regressions
+Similar idea but we'll pick a few continuous phenotypes and apply an inverse-rank normal transform.
+We'll re-use the covariates from `was_phenos`
+
+```{r}
+weight = bb$get_phenotype_data(namespace='UK_BIOBANK', phenotype_set = "UKBB_43361", 
+                               field_id = 21002, instance = 0, index=0, value_cast = 'float')
+weight = data.frame(eid = weight$eid, weight = weight$value)
+ldl_direct = bb$get_phenotype_data(namespace='UK_BIOBANK', phenotype_set = "UKBB_43361", 
+                                        title='LDL direct', instance = 0, index=0, value_cast = 'float')
+ldl_direct = data.frame(eid = ldl_direct$eid, ldl_direct = ldl_direct$value)
+systolic_bp = bb$get_phenotype_data(namespace='UK_BIOBANK', phenotype_set = "UKBB_43361", 
+                                    field_id = 4080, instance = 0, index=0, value_cast = 'float')
+systolic_bp = data.frame(eid = systolic_bp$eid, systolic_bp = systolic_bp$value)
+lwas_phenos = merge(was_phenos, weight, by='eid', all.x=T)
+lwas_phenos = merge(lwas_phenos, ldl_direct, by='eid', all.x=T)
+lwas_phenos = merge(lwas_phenos, systolic_bp, by='eid', all.x=T)
+lwas_phenos = lwas_phenos[, c('eid', 'weight', 'ldl_direct', 'systolic_bp', 'age', 'sex', paste0('pcomp_', c(1:10)))]
+lwas_phenos
+```
+
+## 4.1 Inverse-Rank Normal Transform
+```{r}
+library(RNOmni)
+lwas_phenos$weight[!is.na(lwas_phenos$weight)] = RankNorm(lwas_phenos$weight[!is.na(lwas_phenos$weight)])
+lwas_phenos$ldl_direct[!is.na(lwas_phenos$ldl_direct)] = RankNorm(lwas_phenos$ldl_direct[!is.na(lwas_phenos$ldl_direct)])
+lwas_phenos$systolic_bp[!is.na(lwas_phenos$systolic_bp)] = RankNorm(lwas_phenos$systolic_bp[!is.na(lwas_phenos$systolic_bp)] )
+hist(lwas_phenos$weight, breaks=50, col='blue')
+```
+
+*IMPORTANT*: now our data.frame has a value for (nearly) every participant and the meaning of `phenotype_na_replacement` has changed. We now use `phenotype_na_replacement='remove'` to exclude `NA` values from analysis:
+```{r}
+linear_assoc = bb$run_association_job (namespace='UKB_200K_WES',
+                                       phenotype_frame = lwas_phenos,
+                                       variant_list = vars,
+                                       covariate_columns =c('age', 'sex', paste0('pcomp_', c(1:10))),
+                                       method = 'plink',
+                                       phenotype_na_replacement = 'remove'
+                                       )
+linear_assoc[order(linear_assoc$pvalue), ]
+```
+
+## 5. Compute Using a Stored Set
+
+Previously we've saved some of these phenotypes into a stored gwas-ready set.
+```{r}
+bb$get_phenotype_fields('UK_BIOBANK', 'EXAMPLE_GWAS_PHENOS')
+```
+
+You can run the association job using the stored set and save the result to an in-database association set.
+You need write permissions on the namespace, or specify output_namespace = 'public'.
+```{r}
+bb$run_association_job (
+  namespace='UK_BIOBANK',
+  phenotype_set = 'EXAMPLE_GWAS_PHENOS',
+  phenotype_field_titles = c(
+    'e78_high_cholesterol',
+    'sr_high_cholesterol',
+    'high_cholesterol_combined',
+    'ldl_direct'),
+
+  covariate_phenotype_set = 'WHITE_BRITISH_UNRELATED_COVARIATES',
+  covariate_field_titles = c('age', 'sex', paste0('pcomp_', c(1:10))),
+
+  variant_namespace = 'UKB_200K_WES',
+  variant_list = vars,
+
+  method = 'plink',
+  phenotype_na_replacement = 0,
+  plink_regression_arguments = 'firth-fallback --covar-variance-standardize',
+
+  output_namespace = 'UK_BIOBANK',
+  output_association_set = 'TEST_HIGH_CHOLESTEROL_STUDY',
+  force_field_overwrite = T
+)
+```
+
+## 5.1 Examine Association Sets
+```{r}
+bb$list_association_sets(
+  namespace = 'UK_BIOBANK'
+)
+```
+
+```{r}
+bb$get_phenotype_fields(
+  namespace = 'UK_BIOBANK',
+  association_set = 'TEST_HIGH_CHOLESTEROL_STUDY'  #important to use 'association_set=' named argument for association sets
+)
+```
+
+Get all the data associations with pvalue < 0.1
+Many other options available; see ?biobank_get_association_data
+```{r}
+bb$get_association_data(
+  namespace='UK_BIOBANK', 
+  association_set = 'TEST_HIGH_CHOLESTEROL_STUDY',
+  max_pvalue = 0.1
+)
+```

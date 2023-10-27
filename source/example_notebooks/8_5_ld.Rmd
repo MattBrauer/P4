@@ -1,0 +1,96 @@
+---
+title: "Paradigm4 Training Notebook: LD Methods"
+output: html_document
+---
+
+PARADIGM4 INC.
+
+This file is distributed along with the Paradigm4 Enterprise SciDB 
+distribution kit and may only be used with a valid Paradigm4 contract 
+and in accord with the terms and conditions specified by that contract.
+
+Copyright (C) 2010 - 2021 Paradigm4 Inc.
+All Rights Reserved.
+
+# 0. Connecting 
+```{r}
+library(biobank)
+```
+
+```{r}
+bb <- connect(
+  host = "127.0.0.1",
+  username = 'scidbadmin',                #<<--- replace with your username
+  password = rstudioapi::askForPassword(),
+  port = 8083,
+  protocol = "https")
+bb$namespace='UK_BIOBANK'
+```
+
+REVEAL/Biobank provides methods for computing windowed linkage-disequilibrium and more precise D' for pairs of variants.
+
+# 1. Windowed LD
+
+Start with a list of variants: PCSK9
+```{r}
+pcsk9_variants = bb$get_annotation_frame(
+  'UKB_200K_WES', 
+  'VEP_LOFTEE_20210504',
+  SYMBOL = 'PCSK9',
+  fields = c('SYMBOL', 'LoF')
+)
+pcsk9_variants
+```
+
+Compute windowed LD for variants in this list.
+Using window_size=10000 and method='position' means that for each variant we will compute LD with all variants within 10,000bp (preceding and following). If, alternatively, we use method='count', we would compute the correlation within the neighboring 10,000 variants; no matter how far away they are.
+
+Note we supply `eid` and that restricts the calculation to only that subpopulation. This is useful to compute LD only in a specific group. Omitting `eid` would compute across all individuals.
+
+This small job takes ~1 minute
+```{r}
+ld_result = bb$compute_ld_window(
+  namespace = 'UKB_200K_WES', 
+  variant_list = pcsk9_variants[, c('chrom', 'pos', 'ref', 'alt')], 
+  eid = bb$get_participants(  
+    namespace='UK_BIOBANK',
+    phenotype_set = 'WHITE_BRITISH_UNRELATED_COVARIATES'),
+  window_size = 10000, 
+  method = 'position'
+)
+
+ld_result
+```
+Plot the result as a heatmap
+```{r}
+unique_vars = sort(unique(c(as.character(ld_result$Var1), as.character(ld_result$Var2))))
+M = matrix(nrow = length(unique_vars), 
+           ncol = length(unique_vars), 
+           data = NA)
+rownames(M) = unique_vars
+colnames(M) = unique_vars
+
+M[ cbind(as.character(ld_result$Var1), as.character(ld_result$Var2)) ] = ld_result$value
+library('plotly')
+plot_ly(
+  x = colnames(M), y = rownames(M),
+  z = M, type = "heatmap")
+```
+
+
+# 2. More Exact Pairwise LD
+
+Given two markers (or two genotype vectors) this method computes D' and a P-Value. This accepts exactly two variants:
+```{r}
+bb$compute_ld(
+  namespace = 'UKB_200K_WES', 
+  variant_list = subset(
+    pcsk9_variants,
+    pos == 55058524 | pos == 55058443
+  )
+)
+```
+
+# 3. Notes:
+
+You can also use `bb$create_ld_set` and `bb$load_ld_data` to create and persist a LD diagonal matrix in DB. These are advanced methods that require file-system / admin access and some careful consideration for how to set up the calculation. Depending on the window size, the result can get quite large and needs to be computed in pieces. For help, write to us at maze_support@paradigm4.com

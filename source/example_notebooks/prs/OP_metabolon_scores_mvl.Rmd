@@ -1,0 +1,578 @@
+---
+title: "Compute OmicsPred Metabolon risk scores for UK_BIOBANK population"
+output: html_document
+---
+
+BEGIN_COPYRIGHT
+
+PARADIGM4 INC.
+This file is distributed along with the Paradigm4 Enterprise SciDB 
+distribution kit and may only be used with a valid Paradigm4 contract 
+and in accord with the terms and conditions specified by that contract.
+
+Copyright (C) 2010 - 2023 Paradigm4 Inc.
+All Rights Reserved.
+
+END_COPYRIGHT
+
+# 0. Connect to biobank
+
+```{r setup}
+library(biobank)
+library(data.table)
+bb <- connect(
+  host = "127.0.0.1",
+  username = 'dgealow',
+  password = rstudioapi::askForPassword(),
+  port = 8083,
+  protocol = "https"
+)
+```
+
+# 1. Un-flip alleles and get unambigous variant IDs
+
+Scores were downloaded from https://www.omicspred.org/Scores/Illumina_Metabolon/INTERVAL
+
+```{bash}
+ls /usr/share/OmicsPred/Metabolon/ | head -n1
+ls /usr/share/OmicsPred/Metabolon/ | tail -n1
+```
+
+```{bash}
+head /usr/share/OmicsPred/Metabolon/OPGS002693_model.txt
+```
+
+```{bash}
+head /usr/share/OmicsPred/Metabolon/OPGS003418_model.txt
+```
+
+```{r}
+first <- 2693
+last <- 3418
+```
+
+
+Read in all variants used in any of the models. We just need chromosome, pos,
+and alleles for now.
+
+```{r}
+all_vars_list <- lapply(first:last, function(i) {
+  fread(
+    file = sprintf("/usr/share/OmicsPred/Metabolon/OPGS%06d_model.txt", i),
+    header = TRUE,
+    sep = "\t"
+  )[, .(chrom = chr, pos, effect_allele, other_allele)]
+})
+```
+
+```{r}
+sapply(all_vars_list, nrow) |> hist(breaks = "scott")
+```
+
+
+```{r}
+all_vars <- rbindlist(all_vars_list)
+anyDuplicated(all_vars)
+```
+
+```{r}
+all_vars
+```
+
+
+Some variants are used in multiple models--eliminate the duplicates.
+
+```{r}
+all_vars_uniq <- unique(all_vars)
+setkey(all_vars_uniq, chrom, pos)
+anyDuplicated(all_vars_uniq, by = c("chrom", "pos"))
+```
+
+```{r}
+all_vars_uniq[duplicated(all_vars_uniq, by = c("chrom", "pos")) | duplicated(all_vars_uniq, by = c("chrom", "pos"), fromLast = T)]
+```
+
+
+Chrom/pos alone would uniquely identifies a variant in this list, due to the
+aggressive pruning to completely unambiguous variants by OmicsPred.
+
+However, they appear to have been inconsistent with the order of the alleles
+between models.
+
+Thankfully, this shouldn't matter because we'll check which allele is which on
+a list-by-list basis when we actually join to the weights.
+
+Assume that the effect allele is the alt allele--which variants are in UKBB?
+
+```{r}
+forward_list <- all_vars_uniq[, .(
+  chrom = chrom,
+  pos = pos,
+  ref = other_allele,
+  alt = effect_allele
+)]
+forward_vars <- bb$get_variants("UK_BIOBANK", variant_list = forward_list)
+```
+
+```{r}
+forward_vars
+```
+
+
+Now assume that the effect allele is the ref allele instead
+
+```{r}
+backward_list <- all_vars_uniq[, .(
+  chrom = chrom,
+  pos = pos,
+  ref = effect_allele,
+  alt = other_allele
+)]
+backward_vars <- bb$get_variants("UK_BIOBANK", variant_list = backward_list)
+```
+
+```{r}
+backward_vars
+```
+
+
+```{r}
+found_vars <- rbind(forward_vars, backward_vars)
+setDT(found_vars, key = c("chrom", "pos", "ref", "alt"))
+```
+
+```{r}
+found_vars
+```
+
+```{r}
+anyDuplicated(found_vars)
+```
+
+These duplicates should be "fully" duplicated--same ref and alt as well
+```{r}
+found_vars <- unique(found_vars)
+```
+
+So now, we should have at most one variant at a position, and this should
+return zero:
+```{r}
+anyDuplicated(found_vars, by = c("chrom", "pos"))
+```
+
+```{r}
+nrow(found_vars)
+nrow(all_vars_uniq)
+nrow(found_vars) / nrow(all_vars_uniq)
+```
+
+Missing about 14% of variants. For now, we'll simply ignore them, excluding
+them from our weightings.
+
+Clean up
+```{r}
+rm(all_vars, all_vars_list, all_vars_uniq, backward_list, backward_vars, forward_list, forward_vars)
+gc()
+```
+
+Read in weights -- flip the sign of the effect if the alleles are flipped
+
+```{r}
+all_weights <- lapply(first:last, function(i) {
+  title <- sprintf("OPGS%06d", i)
+  weights <- fread(
+    file = file.path("/usr/share/OmicsPred/Metabolon/", paste0(title, "_model.txt")),
+    header = TRUE,
+    sep = "\t"
+  )[, .(chrom = chr, pos, effect_allele, other_allele, effect)]
+  found_weights <- merge(weights, found_vars, by = c("chrom", "pos"))
+  # Do a more thorough check that ref and alt are sensible
+  stopifnot(all(found_weights[, (effect_allele == ref & other_allele == alt) | (effect_allele == alt & other_allele == ref)]))
+  found_weights[effect_allele == ref, effect := -effect]
+  found_weights[, effect_allele := NULL] # don't need this anymore--save memory
+  found_weights[, other_allele := NULL] # don't need this anymore--save memory
+  setkey(found_weights, chrom, pos, ref, alt)
+  return(found_weights)
+})
+```
+
+```{r}
+all_weights[[1]]
+```
+
+```{r}
+names(all_weights) <- as.character(first:last)
+```
+
+```{r}
+all_weights[["2693"]]
+```
+
+
+# 2. Convert into minimal form for MVL input
+
+```{r}
+variant_list_list <- lapply(names(all_weights), function(label) {
+  dt <- copy(all_weights[[label]])
+  dt[, effect := NULL]
+  dt[, list_label := label]
+})
+```
+
+Pare down all_weights
+
+```{r}
+for (dt in all_weights) {
+  dt[, vid := paste(chrom, pos, ref, alt, sep = ":")]
+  dt[, c("chrom", "pos", "ref", "alt") := NULL]
+  setkey(dt, vid)
+}
+```
+
+```{r}
+all_weights[[1]]
+```
+
+```{r}
+variant_list <- rbindlist(variant_list_list)
+variant_list
+```
+
+```{r}
+variant_list[, .N, by = list_label]
+```
+
+```{r}
+(first:last)[!(as.character(first:last) %in% variant_list$list_label)]
+```
+
+No variants were found in those lists--they will be skipped
+
+# 3. Prepare scoring function
+
+```{r}
+compute_score <- function(args, label, genos) {
+  
+  if (anyNA(genos)) {
+    stop("missing genotypes!")
+  }
+  
+  # # Mean-impute missing genotypes
+  # mean_dosages <- colMeans(genos, na.rm = TRUE)
+  # for (i in 1:dim(genos)[2]) {
+  #   genos[is.na(genos[,i]), i] <- mean_dosages[i]
+  # }
+  
+  # Multiply by weights
+  weights <- args[[label]]
+  # stopifnot(all(weights$vid == colnames(genos)))
+  effects <- weights[colnames(genos), effect] # index by vid
+  scores <- genos %*% effects
+  
+  # Condense down the representation -- don't return eids as 64-byte
+  # character strings!
+  colnames(scores) <- sprintf("OPGS%06d", as.integer(label))
+  scores <- data.table::as.data.table(scores, keep.rownames = "eid")
+  scores[, eid := as.integer(eid)]
+  return(scores)
+}
+```
+
+
+Testing won't work right due to an error in bb$get_genotypes' handling of
+matrix_dose_cutoff (will be fixed in an upcoming biobank release).
+
+Test it out:
+
+```{r}
+# test_genos <- bb$get_genotypes(
+#   namespace = "UK_BIOBANK",
+#   variant_list = variant_list[list_label == "2693"],
+#   format = "dose_matrix"
+# )
+# test_result <- compute_score(all_weights, "2693", test_genos)
+```
+
+```{r}
+# test_result[]
+```
+
+
+```{r}
+# result_size <- object.size(test_result)
+# result_size
+```
+
+We need to make sure the result returned from each task is under 2 GB -- how
+many lists can we fit?
+
+```{r}
+# 2e9 / result_size
+```
+
+```{r}
+# result_size * 200
+```
+
+```{r}
+# result_size * 200 / 1e9
+```
+
+200 per task should give us results no bigger than about 1.2 GB -- we want to
+leave some buffer.
+
+
+# 4. Run MVL
+
+Cleanup:
+```{r}
+rm(dt, found_vars, test_genos, variant_list_list, result_size)
+gc()
+```
+
+Note: `max_lists_per_task` requires the latest development versions of the
+BurstMode (1.0.0.9000) and biobank (2023.4.3.9000) packages.
+
+WARNING: The full result object for a run of this size takes up about 80 GB
+of memory.
+
+Kick off the run:
+
+```{r}
+t_start <- proc.time()
+result_list <- bb$map_variant_lists(
+  namespace = "UK_BIOBANK",
+  variant_lists = variant_list,
+  func = compute_score,
+  args = all_weights,
+  genotype_format = "dose_matrix",
+  matrix_dose_cutoff = 0, # DON'T impute any genotypes--take the dosages we have
+  # This limit ensures the output from each worker isn't too big--see above
+  max_lists_per_task = 200
+)
+t_end <- proc.time()
+```
+
+```{r}
+(t_end - t_start)["elapsed"] / 60
+```
+
+About 10 minutes, 60 cents
+
+```{r}
+result_list[["2693"]]
+```
+
+Did any tasks not return a data table?
+```{r}
+names(result_list)[!sapply(result_list, is.data.table)]
+```
+
+View error messages of failed tasks (if any failed):
+```{r}
+#View(unlist(result_list[!sapply(result_list, is.data.table)]))
+```
+
+```{r}
+# all.equal(result_list[["17227"]], test_result)
+```
+
+```{r}
+format(object.size(result_list), units = "GiB")
+```
+
+
+## Compile results
+
+Clean up--don't want to run out of memory
+
+```{r}
+rm(all_weights, test_result, variant_list, t_start, t_end, compute_score)
+gc()
+```
+
+```{r}
+final_table <- copy(result_list[[1]])
+```
+
+Building incrementally is better memory-wise than a single giant cbind
+
+```{r}
+for (result in result_list) {
+  stopifnot(all(result$eid == final_table$eid)) # Make sure eids are in the same order
+  result[, eid := NULL] # Free up memory of redundant data
+  model <- colnames(result)
+  final_table[, (model) := result[[model]]]
+  result[, (model) := NULL] # Free up more memory
+  gc()
+}
+```
+
+```{r}
+final_table[1:5, 1:5]
+```
+
+```{r}
+setcolorder(final_table, sort(colnames(final_table)))
+```
+
+```{r}
+final_table[1:5, 1:5]
+```
+
+```{r}
+anyNA(final_table)
+```
+
+## Backup final table to disk in case of a crash
+
+```{r}
+fwrite(final_table,
+  file = "~/staging/OP_rnaseq.csv"
+)
+```
+
+```{bash}
+head ~/staging/OP_rnaseq.csv | cut -d, -f -5
+```
+
+
+Read in the final table from disk if we had to restart for some reason:
+```{r}
+# final_table <- fread(
+#   "~/staging/OP_rnaseq.csv",
+#   header = TRUE,
+#   sep = ",",
+#   verbose = T
+# )
+```
+
+
+```{r}
+final_table[1:5,1:5]
+```
+
+# 5. Create a phenotype set
+
+## Compile metadata
+
+```{bash}
+head /usr/share/OmicsPred/Metabolon_trait_validation_results_with_OMICSPRED_ID.csv | cut -f -7 | column -s$'\t' -t
+```
+
+```{r}
+metadata <- fread("/usr/share/OmicsPred/Metabolon_trait_validation_results_with_OMICSPRED_ID.csv")
+metadata
+```
+
+```{r}
+setnames(metadata, gsub(" ", "_", colnames(metadata)))
+metadata
+```
+
+
+```{r}
+anyDuplicated(metadata$OMICSPRED_ID)
+```
+
+```{r}
+setkey(metadata, OMICSPRED_ID)
+```
+
+```{r}
+any(grepl(",", metadata$Metabolon_ID))
+any(grepl(",", metadata$Biochemical_Name))
+any(grepl(",", metadata$Super_Pathway))
+any(grepl(",", metadata$Sub_Pathway))
+```
+
+```{r}
+any(grepl('"', metadata$Metabolon_ID))
+any(grepl('"', metadata$Biochemical_Name))
+any(grepl('"', metadata$Super_Pathway))
+any(grepl('"', metadata$Sub_Pathway))
+```
+
+```{r}
+any(grepl("'", metadata$Metabolon_ID))
+any(grepl("'", metadata$Biochemical_Name))
+any(grepl("'", metadata$Super_Pathway))
+any(grepl("'", metadata$Sub_Pathway))
+```
+
+```{r}
+metadata[, notes := paste0('{Metabolon_ID: ', Metabolon_ID, ', Biochemical_Name: "', Biochemical_Name, '", Super_Pathway: "', Super_Pathway, '", Sub_Pathway: "', Sub_Pathway, '"}')]
+```
+
+
+```{r}
+metadata
+```
+
+This structure can be machine-parsed by yaml.load:
+```{r}
+yaml::yaml.load(metadata[1, "notes"])
+```
+
+```{r}
+notes_to_load <- metadata[colnames(final_table)[2:ncol(final_table)], notes]
+head(notes_to_load)
+```
+
+Clean up
+```{r}
+rm(metadata, result, result_list, model)
+gc()
+```
+
+Data frames work more reliably with our bulk upload than data tables
+```{r}
+setDF(final_table)
+```
+
+
+## Upload the set
+
+You can also add to an existing set with `bb$add_phenotype_fields()`
+
+This may take a while.
+
+```{r}
+bb$add_phenotype_fields(
+  namespace = "public",
+  phenotype_set = "OmicsPred",
+  data = final_table,
+  value_type = rep_len("Continuous", ncol(final_table) - 1),
+  description = rep_len("https://www.omicspred.org/Scores/Metabolon/INTERVAL", ncol(final_table) - 1),
+  notes = notes_to_load,
+  allow_new_eids = FALSE,
+  allow_non_unique_fields = FALSE,
+  use_build = TRUE, # Optimize the upload by prefilling with the most common value
+  build_value = 0.0, # The most common value is zero.
+  verbose = TRUE
+)
+```
+
+Check if upload worked properly:
+
+```{r}
+bb$list_phenotype_sets()
+```
+
+```{r}
+fields <- bb$get_phenotype_fields(phenotype_set = "OmicsPred")
+fields
+```
+
+```{r}
+tail(fields)
+```
+
+```{r}
+uploaded_data <- bb$get_phenotype_data(phenotype_set = "OmicsPred", title = "OPGS002693", value_cast = "double", minimal = T)
+```
+
+```{r}
+setDT(uploaded_data, key = "eid")
+uploaded_data
+```

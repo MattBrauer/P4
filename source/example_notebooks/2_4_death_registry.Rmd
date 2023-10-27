@@ -1,0 +1,64 @@
+---
+title: "Paradigm4 Training Notebook: death registry API"
+output: html_document
+---
+
+PARADIGM4 INC.
+
+This file is distributed along with the Paradigm4 Enterprise SciDB 
+distribution kit and may only be used with a valid Paradigm4 contract 
+and in accord with the terms and conditions specified by that contract.
+
+Copyright (C) 2010 - 2021 Paradigm4 Inc.
+All Rights Reserved.
+
+# 0. Connecting
+```{r}
+library(biobank)
+```
+
+```{r}
+bb <- connect(
+  host = "127.0.0.1",
+  username = 'scidbadmin',                  #replace with your username
+  password = rstudioapi::askForPassword(), 
+  port = 8083,
+  protocol = "https")
+bb$namespace='UK_BIOBANK'
+```
+
+Note that no death registry data is currently ingested.
+
+# 1. Death Registry Queries
+
+The death registry has cause-of-death data for UK Biobank participants, organized by `eid` and ICD-10 cause of death. We return one record per cause and there can be multiple causes. Thus this API call can return more than one record per eid. By default it returns all data
+```{r}
+all_death_records = bb$get_death_registry(namespace = 'UK_BIOBANK')
+head(all_death_records)
+```
+
+```{r}
+nrow(all_death_records)
+```
+
+Note there are on average just over 2 records per eid
+```{r}
+length(unique(all_death_records$eid))
+```
+
+You can also search by eid or ICD10 code
+```{r}
+bb$get_death_registry(namespace = 'UK_BIOBANK', eid = c(2669221, 2668315))
+```
+
+```{r}
+bb$get_death_registry(namespace = 'UK_BIOBANK', cause_icd10 = c('C64', 'I251'))
+```
+
+
+# X. Loading Data 
+
+For users with admin privileges - copy the two UK_BIOBANK files - `death.txt` and `death_cause.txt` to a directory of your choice and then invoke like so. This will update all records in the specified namespace.
+```{r}
+bb$load_death_registry(namespace = 'UK_BIOBANK', directory = '/home/scidb/death_registry')
+```

@@ -1,0 +1,149 @@
+---
+title: "Paradigm4 General Practitioner (GP) Data query examples"
+output: html_document
+---
+
+PARADIGM4 INC.
+
+This file is distributed along with the Paradigm4 Enterprise SciDB 
+distribution kit and may only be used with a valid Paradigm4 contract 
+and in accord with the terms and conditions specified by that contract.
+
+Copyright (C) 2010 - 2021 Paradigm4 Inc.
+All Rights Reserved.
+
+For background on the data, see http://biobank.ndph.ox.ac.uk/showcase/refer.cgi?id=591
+UKBB also provided a set of mapping spreadsheets that we used to map from read codes to their meanings, ICD10 and OPCS4: http://biobank.ndph.ox.ac.uk/showcase/refer.cgi?id=592
+
+# 0. Connecting
+```{r}
+library(biobank)
+```
+
+```{r}
+bb <- connect(
+  host = "127.0.0.1",
+  username = 'scidbadmin',                  #replace with your username
+  password = rstudioapi::askForPassword(), 
+  port = 8083,
+  protocol = "https")
+bb$namespace='UK_BIOBANK'
+```
+
+Note that no GP data is currently ingested.
+
+# 1. GP Scripts Data
+
+This data contains records for each drug prescription, searchable by eid, drug names and codes.
+
+## 1.1 Keyword Search
+
+Search 'drug_name' by keyword. This returns case-insensitive keyword matches for the supplied term.
+```{r}
+bb$get_gp_scripts(drug_name_contains = 'lipitor')
+```
+
+The argument `drug_name_contains` supports regular expressions. You can search multiple keywords like this:
+```{r}
+x = bb$get_gp_scripts(drug_name_contains = '(lipitor|atorvastatin).*40')
+x
+```
+
+Note the variation in drug names
+```{r}
+table(x$drug_name)
+```
+
+## 1.2 Other Options
+
+Exact match for drug name. Can use a vector of multiple names:
+```{r}
+bb$get_gp_scripts(drug_name=c('LIPITOR tabs 40mg', 'LIPITOR 40mg tablets'))
+```
+
+Exact match for BNF code:
+```{r}
+bb$get_gp_scripts(bnf_code=c('0212000B0BBAAAA', '0212000B0BBABAB'))
+```
+
+Exact match for DMD code:
+```{r}
+bb$get_gp_scripts(dmd_code = '320030001')
+```
+
+Aggregations:
+```{r}
+all_lipitor_terms = bb$get_gp_scripts(namespace = 'UK_BIOBANK', 
+                                  drug_name_contains = '(lipitor|atorvastatin)', 
+                                  aggregate="count(*)", group_by = c("drug_name"))
+all_lipitor_terms
+```
+
+Subset by data_provider:
+```{r}
+bb$get_gp_scripts(namespace = 'UK_BIOBANK', 
+                  drug_name=all_lipitor_terms$drug_name,
+                  data_provider = c(2,3))
+```
+
+Subset by eid:
+```{r}
+bb$get_gp_scripts(namespace = 'UK_BIOBANK', eid = c(5064325, 2374891, 2374891))
+```
+
+# 2. GP Clinical Data
+
+The clinical data covers doctors' observations, procedures and some diagnostic measurements. The overall usage is similar to scripts but there are more terms and codes to search by.
+
+Search by eid:
+```{r}
+bb$get_gp_clinical( eid=4693115 )
+```
+
+Search by ICD code / data provider. Note you can use exact match like "icd10 = 'I251'" but some read codes map to multiple ICD codes and those would not be returned
+```{r}
+bb$get_gp_clinical(icd10_contains = 'I25', data_provider = c(3,4))
+```
+
+Search the LKP terms for a keyword, with aggregation:
+```{r}
+bb$get_gp_clinical(lkp_contains = 'asthma', aggregate = "count(*)", group_by="lkp")
+```
+
+Look at procedure codes mapped to OPCS4:
+```{r}
+procedures = bb$get_gp_clinical(aggregate="count(*)", group_by=c("opcs4", "lkp"))
+head(procedures[order(procedures$count, decreasing=T), ])
+```
+
+Look at disease codes mapped to ICD10:
+```{r}
+icd10_codes = bb$get_gp_clinical(aggregate="count(*)", group_by=c("icd10", "lkp"))
+head(icd10_codes[order(icd10_codes$count, decreasing=T), ])
+```
+
+Get all LKP terms:
+```{r}
+all_lkp = bb$get_gp_clinical(aggregate = "count(*)", group_by="lkp")
+all_lkp[order(all_lkp$count, decreasing = T), ]
+```
+
+Search for lkp term by exact match:
+```{r}
+bb$get_gp_clinical(namespace='UK_BIOBANK', lkp = 'Asymptomatic coronary heart disease')
+```
+
+Search for read3 codes:
+```{r}
+bb$get_gp_clinical(namespace='UK_BIOBANK', read_3=c('XaG1Q', 'G34z0'))
+```
+
+# X: Admin Section: Updating Data
+
+Admin users may update the GP data like so. This will only work for users who have administrator privileges. First, download the updated files (gp_clinical.txt and gp_scripts.txt) from UKBB and place them on the server into a directory like ~/gp.
+Make sure to use the full directory path here, like '/home/USERNAME/gp'. Do not use '~'.
+
+```{r}
+  bb$load_gp_data(namespace = 'UK_BIOBANK',
+                  data_directory = '/home/my_user_name/gp')
+```

@@ -1,0 +1,772 @@
+---
+title: "Phecode Construction"
+output: html_document
+---
+
+PARADIGM4 INC.
+
+This file is distributed along with the Paradigm4 Enterprise SciDB
+distribution kit and may only be used with a valid Paradigm4 contract
+and in accord with the terms and conditions specified by that contract.
+Copyright (C) 2023 Paradigm4 Inc.
+
+All Rights Reserved.
+
+# 0. About
+
+This notebook illustrates how to assemble a PheCode workflow into a stored 
+Phenotype Set. A quick PheWas example at the end shows how to use the uploaded
+phenotypes.
+
+We've run this notebook once and created the set PHECODE_AGE_UKBB_45561
+For example usage, skip to the last section.
+
+# 1. Connect
+
+```{r}
+library(biobank)
+library(data.table)
+```
+
+```{r}
+bb <- connect(
+  host = "127.0.0.1",
+  username = 'scidbadmin',
+  password = rstudioapi::askForPassword(),
+  port = 8083,
+  protocol = "https"
+)
+```
+
+# 2. Setup workspace
+
+```{bash}
+mkdir -p ~/phecodes
+cd ~/phecodes
+wget https://raw.githubusercontent.com/atgu/ukbb_pan_ancestry/master/data/UKB_Phecode_v1.2b1_ICD_Mapping.txt
+```
+
+```{r}
+phecode_mapping = fread('~/phecodes/UKB_Phecode_v1.2b1_ICD_Mapping.txt', colClasses = 'character')
+phecode_mapping
+```
+
+```{r}
+bb$list_phenotype_sets("UK_BIOBANK")
+```
+
+Set the namespace/basket we are constructing PheCodes from and where we will upload them.
+Note you may not have permissions to upload to `UK_BIOBANK` but you can upload to `public`
+
+```{r}
+SOURCE_NAMESPACE = 'UK_BIOBANK'
+SOURCE_PHENOTYPE_SET = 'UKBB_45561'
+
+TARGET_NAMESPACE = 'UK_BIOBANK'
+TARGET_PHENOTYPE_SET_NAME = 'PHECODE_WITH_AGES_UKBB_45561'
+```
+
+Set which fields we will use. 
+
+```{r}
+# Include primary and secondary causes of death, cancer codes, external causes,
+# and main and secondary diagnoses. Here, rather than including primary and 
+# secondary diagnostic fields individually, we leverage fields 41270 and 41271.
+# These fields aggregate unique ICD codes for each participant from both the 
+# primary and secondary fields.
+# Field 41201 does not have age data linked, so we will not use it.
+ICD10_FIELDS = c(
+  40001, # death primary
+  40002, # death secondary 
+  40006, # cancer
+  41270) # diagnoses (primary + secondary)
+ICD9_FIELDS = c(
+  40013, # cancer
+  41271) # diagnoses (primary + secondary)
+```
+
+# 3. Collate ICD and age data
+
+```{r}
+all_codes <- bb$get_phenotype_data(
+  namespace = SOURCE_NAMESPACE,
+  phenotype_set = SOURCE_PHENOTYPE_SET,
+  field_id = c(ICD10_FIELDS, ICD9_FIELDS)
+  # Keep instance and index information for linking to dates
+)
+all_codes
+```
+
+```{r}
+ages <- bb$get_phenotype_data(
+  namespace = SOURCE_NAMESPACE,
+  phenotype_set = SOURCE_PHENOTYPE_SET,
+  field_id = c(40007, 40008)
+)
+ages
+```
+
+```{r}
+setDT(ages)
+ages[, age := as.numeric(value)]
+ages[, value := NULL]
+ages[, title := NULL]
+```
+
+```{r}
+ages
+```
+
+```{r}
+year_of_birth <- bb$get_phenotype_data(
+  namespace = SOURCE_NAMESPACE,
+  phenotype_set = SOURCE_PHENOTYPE_SET,
+  field_id = c(34),
+  minimal = T
+)
+year_of_birth
+```
+
+```{r}
+month_of_birth <- bb$get_phenotype_data(
+  namespace = SOURCE_NAMESPACE,
+  phenotype_set = SOURCE_PHENOTYPE_SET,
+  field_id = c(52),
+  minimal = T
+)
+month_of_birth
+```
+
+```{r}
+setDT(year_of_birth)
+setDT(month_of_birth)
+year_of_birth[, year := as.numeric(value)]
+year_of_birth[, field_id := NULL]
+year_of_birth[, value := NULL]
+month_of_birth[, month := as.numeric(value)]
+month_of_birth[, field_id := NULL]
+month_of_birth[, value := NULL]
+year_of_birth
+month_of_birth
+```
+
+```{r}
+dob <- merge(year_of_birth, month_of_birth, by = "eid")
+dob
+```
+
+```{r}
+dob[, numeric_dob := year + (month / 12)]
+dob
+```
+
+```{r}
+anyNA(dob)
+```
+
+```{r}
+dob[, year := NULL]
+dob[, month := NULL]
+dob
+```
+
+```{r}
+date_fields <- bb$get_phenotype_data(
+  namespace = SOURCE_NAMESPACE,
+  phenotype_set = SOURCE_PHENOTYPE_SET,
+  field_id = c(41280, 41281)
+)
+date_fields
+```
+
+```{r}
+setDT(date_fields)
+date_fields[, title := NULL]
+date_fields[, date := as.Date(value)]
+date_fields[, year := as.numeric(format(date, "%Y"))]
+date_fields[, month := as.numeric(format(date, "%m"))]
+date_fields[, numeric_date := year + (month / 12)]
+date_fields
+```
+
+```{r}
+date_fields[, c("value", "date", "year", "month") := NULL]
+date_fields
+```
+
+```{r}
+date_fields_age_converted <- merge(date_fields, dob, by = "eid", all.x = T, all.y = F)
+date_fields_age_converted
+```
+
+```{r}
+anyNA(date_fields_age_converted)
+```
+
+```{r}
+date_fields_age_converted[, age := numeric_date - numeric_dob]
+date_fields_age_converted
+```
+
+Sanity check
+```{r}
+min(date_fields_age_converted$age)
+max(date_fields_age_converted$age)
+```
+
+```{r}
+date_fields_age_converted[, c("numeric_date", "numeric_dob") := NULL]
+```
+
+```{r}
+ages
+date_fields_age_converted
+```
+
+```{r}
+all_ages <- rbind(ages, date_fields_age_converted)
+all_ages
+```
+
+```{r}
+setDT(all_codes)
+all_codes[, title := NULL]
+all_codes
+```
+
+```{r}
+anyNA(all_ages)
+anyNA(all_codes)
+```
+
+```{r}
+all_codes[field_id == 40001 | field_id == 40002, age_field_id := 40007] # Death
+all_codes[field_id == 40006 | field_id == 40013, age_field_id := 40008] # Cancer
+all_codes[field_id == 41270, age_field_id := 41280] # Diagnoses (ICD10)
+all_codes[field_id == 41271, age_field_id := 41281] # Diagnoses (ICD9)
+all_codes
+```
+
+```{r}
+setnames(all_codes, "value", "code")
+all_codes
+```
+
+```{r}
+all_codes[field_id == 40002, index := 0] # Secondary causes of death all happened on the same date as primary
+```
+
+```{r}
+setnames(all_ages, "field_id", "age_field_id")
+all_ages
+```
+
+```{r}
+codes_with_ages <- merge(all_codes, all_ages, by = c("eid", "age_field_id", "instance", "index"))
+codes_with_ages
+```
+
+```{r}
+anyNA(codes_with_ages)
+```
+
+
+Don't care about which specific field data came from any more
+
+```{r}
+codes_with_ages[, c("field_id", "age_field_id", "instance", "index") := NULL]
+setkey(codes_with_ages, code) # Sort now to make filtering by code fast
+codes_with_ages
+```
+
+# 4. Collate sex data
+
+Download the sex data from the namespace
+```{r}
+sex_data_raw = bb$get_phenotype_data(
+  namespace = SOURCE_NAMESPACE,
+  phenotype_set = SOURCE_PHENOTYPE_SET,
+  field_id = c(
+    31,     # Sex
+    22001), # Genetic sex
+  all_eids = T
+)
+setDT(sex_data_raw)
+encoding <- bb$get_encoding(SOURCE_NAMESPACE, encoding_id = 9)
+setDT(encoding)
+sex_data_decoded = encoding[sex_data_raw, c("eid", "field_id", "meaning"), on = "value"]
+sex_data_decoded
+```
+
+```{r}
+unique(phecode_mapping$sex)
+```
+
+```{r}
+sex_data <- dcast(sex_data_decoded, eid ~ field_id, value.var = "meaning")
+sex_data
+```
+
+```{r}
+setnames(sex_data, old = c("31", "22001"), new = c("sex", "genetic_sex"))
+sex_data
+```
+
+
+How many individuals are missing a genetic sex determination?
+```{r}
+table(sex_data$genetic_sex, useNA = 'always')
+```
+
+What are the counts for sex?
+```{r}
+table(sex_data$sex, useNA = "always")
+```
+
+
+How many mismatches are there between sex and genetic sex (for individuals
+for which we have both)?
+
+```{r}
+sex_data[sex != genetic_sex]
+```
+
+```{r}
+sex_data[sex == genetic_sex, agreed_sex := sex]
+```
+
+```{r}
+sex_data[is.na(sex) | is.na(genetic_sex) | sex != genetic_sex]
+```
+
+```{r}
+sex_data
+```
+
+```{r}
+table(sex_data$agreed_sex, useNA = "always")
+```
+
+# 5. Collate censor age (age at death, or age at end of data collection)
+
+```{r}
+censor_age <- bb$get_phenotype_data(
+  namespace = SOURCE_NAMESPACE,
+  phenotype_set = SOURCE_PHENOTYPE_SET,
+  field_id = 40007, # Age at death
+  instance = 0, index = 0,
+  all_eids = T
+)
+censor_age
+```
+
+```{r}
+setDT(censor_age, key = "eid")
+censor_age[, age := as.numeric(value)]
+censor_age[, c("title", "field_id", "instance", "index", "value") := NULL]
+censor_age
+```
+
+```{r}
+all_dates <- bb$get_phenotype_data(
+  namespace = SOURCE_NAMESPACE,
+  phenotype_set = SOURCE_PHENOTYPE_SET,
+  field_id = c(
+    40000, # date of death
+    40005, # cancer
+    41280, # icd10
+    41281 # icd9
+  ),
+  minimal = T
+)
+```
+
+```{r}
+all_dates
+```
+
+```{r}
+latest_date <- max(as.Date(all_dates$value))
+latest_date
+```
+
+```{r}
+latest_date_num <- as.numeric(format(latest_date, "%Y")) +
+  (as.numeric(format(latest_date, "%m")) / 12)
+latest_date_num
+```
+
+```{r}
+dob
+```
+
+```{r}
+censor_age[!(eid %in% dob$eid)]
+```
+```{r}
+6025289 %in% codes_with_ages$eid
+```
+```{r}
+bb$get_phenotype_data(
+  namespace = SOURCE_NAMESPACE,
+  phenotype_set = SOURCE_PHENOTYPE_SET,
+  field_id = c(22200, 52, 53, 21003, 21022),
+  eid = 6025289
+)
+```
+We don't seem to have any age or daterecords for this single eid; we'll exclude
+them from this set (since they'll end up with 0 for all phecodes but NA
+for the censor age, and thus would introduce an NA censor age into all
+associations).
+
+
+```{r}
+censor_age <- merge(censor_age, dob, by = "eid", all.x = T)
+```
+
+```{r}
+censor_age
+```
+
+```{r}
+censor_age[is.na(age), age := latest_date_num - numeric_dob]
+censor_age
+```
+
+```{r}
+censor_age[, numeric_dob := NULL]
+```
+
+```{r}
+censor_age
+censor_age[is.na(age)]
+key(censor_age)
+```
+
+```{r}
+eids_with_no_data <- censor_age[is.na(age), eid]
+eids_with_no_data
+```
+
+```{r}
+sex_data <- sex_data[!(eid %in% eids_with_no_data)]
+censor_age <- censor_age[!(eid %in% eids_with_no_data)]
+sex_data
+censor_age
+```
+
+
+# 6. Assemble the PheCodes as a data frame
+
+We use the first column for eid (numeric) and add one numeric (1,0,NA) column 
+for each code. When using this method, local RAM usage can be a concern. At 
+~1500 phecodes, the frame uses about 7GB, which is not much for our primary 
+server.
+
+```{r}
+phecodes_frame <- bb$get_participants(
+    namespace= SOURCE_NAMESPACE, 
+    phenotype_set = SOURCE_PHENOTYPE_SET
+)
+setDT(phecodes_frame, key = "eid") # Order by eid for efficient inserts
+
+# Exclude the ageless EID:
+phecodes_frame <- phecodes_frame[!(eid %in% eids_with_no_data)]
+key(phecodes_frame)
+phecodes_frame
+```
+
+
+```{r}
+#add cases for each PheCode
+for( i in 1:nrow(phecode_mapping) ) {
+  phecode_id <- phecode_mapping$phecode[i]
+  # initialize all to 0
+  phecodes_frame[, (phecode_id) := 0L]
+  # initialize age to censor age
+  phecodes_frame[, paste0(phecode_id, "_age") := censor_age$age]
+  icd_codes <- strsplit(phecode_mapping$icd_codes[i], ",")[[1]]
+  case_data <- codes_with_ages[code %in% icd_codes, .(age = min(age)), keyby = eid]
+  # Since we sorted both these by eid, this can be an in-place insert rather than a join
+  phecodes_frame[eid %in% case_data$eid, (phecode_id) := 1L]
+  phecodes_frame[eid %in% case_data$eid, paste0(phecode_id, "_age") := case_data$age]
+  if (i %% 20 == 0) {
+    print(sprintf("%04d / %04d", i, nrow(phecode_mapping)))
+  }
+}
+```
+
+The "no non-missing arguments to min; returning Inf" warning is spurious; it
+occurs when there are no cases of a phecode (and thus case_data is empty), but
+no `Inf` values are actually inserted.
+
+```{r}
+head(phecodes_frame[, 1:5])
+```
+
+```{r}
+anyNA(phecodes_frame)
+```
+
+```{r}
+num_phecodes <- nrow(phecode_mapping)
+num_phecodes == (length(phecodes_frame) - 1) / 2
+num_phecodes
+```
+
+```{r}
+phecode_indices <- (1:num_phecodes) * 2
+age_indices <- phecode_indices + 1
+head..phecode_indices
+tail(age_indices)
+length(phecodes_frame)
+head(colnames(phecodes_frame)[phecode_indices])
+head(colnames(phecodes_frame)[age_indices])
+tail(colnames(phecodes_frame)[phecode_indices])
+tail(colnames(phecodes_frame)[age_indices])
+```
+
+```{r}
+ones <- sum(phecodes_frame[, ..phecode_indices], na.rm = T)
+zeros <- sum(1 - phecodes_frame[, ..phecode_indices], na.rm = T)
+nas <- sum(is.na(phecodes_frame[, ..phecode_indices]))
+print(ones)
+print(zeros)
+print(nas)
+print(ones + zeros + nas)
+print(num_phecodes * nrow(phecodes_frame))
+```
+
+exclude sibling PheCode controls (set to NA)
+
+```{r}
+for (i in 1:nrow(phecode_mapping)) {
+  phecode_id <- phecode_mapping$phecode[i]
+  codes_to_exclude <- strsplit(phecode_mapping$exclude_phecodes[i], ",")[[1]]
+  # Build exclusion mask of rows with 1 for any of the codes to exclude
+  mask <- rowSums(phecodes_frame[, ..codes_to_exclude], na.rm = T) > 0 &
+    phecodes_frame[[phecode_id]] == 0L
+  phecodes_frame[mask, (phecode_id) := NA]
+  phecodes_frame[mask, paste0(phecode_id, "_age") := NA]
+  
+  if (i %% 20 == 0) {
+    print(sprintf("%04d / %04d", i, nrow(phecode_mapping)))
+  }
+}
+```
+
+```{r}
+head(phecodes_frame[, 1:10])
+```
+
+```{r}
+ones <- sum(phecodes_frame[, ..phecode_indices], na.rm = T)
+zeros <- sum(1 - phecodes_frame[, ..phecode_indices], na.rm = T)
+nas <- sum(is.na(phecodes_frame[, ..phecode_indices]))
+print(ones)
+print(zeros)
+print(nas)
+```
+
+exclude males or females from sex-specific PheCodes
+```{r}
+not_female <- sex_data[is.na(agreed_sex) | agreed_sex == "Male", eid]
+not_male <- sex_data[is.na(agreed_sex) | agreed_sex == "Female", eid]
+```
+
+```{r}
+length(not_female)
+length(not_male)
+```
+
+
+```{r}
+for (i in 1:nrow(phecode_mapping)) {
+  if (i %% 20 == 0) {
+    print(sprintf("%04d / %04d", i, nrow(phecode_mapping)))
+  }
+  
+  phecode_id <- phecode_mapping$phecode[i]
+
+  sex_condition = phecode_mapping$sex[i]
+  if (sex_condition == 'both_sexes') {
+    next
+  } else if (sex_condition == 'females') {
+    # Exclude Male and Undetermined participants
+    phecodes_frame[eid %in% not_female, c(phecode_id, paste0(phecode_id, "_age")) := NA]
+  } else if (sex_condition == 'males') {
+    # Exclude Female and Undetermined participants
+    phecodes_frame[eid %in% not_male, c(phecode_id, paste0(phecode_id, "_age")) := NA]
+  } else {
+    stop(paste("Unexpected sex_condition:", sex_condition))
+  }
+}
+```
+
+```{r}
+ones <- sum(phecodes_frame[, ..phecode_indices], na.rm = T)
+zeros <- sum(1 - phecodes_frame[, ..phecode_indices], na.rm = T)
+nas <- sum(is.na(phecodes_frame[, ..phecode_indices]))
+print(ones)
+print(zeros)
+print(nas)
+```
+
+```{r}
+head(phecodes_frame[, 1:10])
+```
+
+# 7. Upload to the database
+
+```{r}
+head(colnames(phecodes_frame))
+tail(colnames(phecodes_frame))
+```
+
+```{r}
+code_titles <- phecode_mapping$phecode
+all(phecode_mapping$phecode == colnames(phecodes_frame)[phecode_indices])
+head(phecode_mapping$phecode)
+```
+
+
+```{r}
+code_titles <-
+  gsub('_$', '',
+  gsub('_+', '_',
+  gsub('[^[:alnum:]_]', '_',
+  paste("phc", phecode_mapping$phecode, phecode_mapping$description, sep = "_")
+)))
+head(code_titles)
+```
+
+```{r}
+max(nchar(code_titles))
+code_titles[which.max(nchar(code_titles))]
+```
+
+```{r}
+age_titles <- paste0("age_", gsub('[^[:alnum:]_]', '_', phecode_mapping$phecode))
+head(age_titles)
+```
+
+```{r}
+all_titles <- c("eid", rbind(code_titles, age_titles))
+head(all_titles)
+tail(all_titles)
+```
+
+```{r}
+setnames(phecodes_frame, all_titles)
+```
+
+```{r}
+head(phecodes_frame[, 1:10])
+```
+
+```{r}
+code_descriptions = paste0(phecode_mapping$phecode, ": ", phecode_mapping$description)
+code_notes = paste0('Constructed from ICD 9/10 codes ', phecode_mapping$icd_codes, 
+               ' excluding phecodes ', phecode_mapping$exclude_phecodes)
+```
+
+```{r}
+age_descriptions = paste("Age at first occurance of", phecode_mapping$phecode, "or death or end of data collection")
+age_notes = paste("If diagnosed with any code comprising", phecode_mapping$phecode, "age at the first such diagnosis. If a deceased control, age at death. If a non-deceased control, age at end of data collection. NA if excluded.")
+```
+
+```{r}
+descriptions <- c(rbind(code_descriptions, age_descriptions))
+notes <- c(rbind(code_notes, age_notes))
+```
+
+
+```{r}
+head(descriptions)
+head(notes)
+```
+
+```{r}
+setDF(phecodes_frame)
+```
+
+```{r}
+overall_note <- paste0('Phecodes generated from ',
+                SOURCE_NAMESPACE, '.', SOURCE_PHENOTYPE_SET, ' fields ',
+                paste0(c(ICD10_FIELDS, ICD9_FIELDS), collapse=', '),
+                '; ages generated from fields 40007, 40008, 41280, 41281, 34, 52; ',
+                'sex exclusions based on consensus of 31 and 22001')
+overall_note
+```
+
+```{r}
+ones <- sum(phecodes_frame[phecode_indices], na.rm = T)
+zeros <- sum(1 - phecodes_frame[phecode_indices], na.rm = T)
+nas <- sum(is.na(phecodes_frame[phecode_indices]))
+age_nas <- sum(is.na(phecodes_frame[age_indices]))
+print(ones)
+print(zeros)
+print(nas)
+print(age_nas)
+print(ones + zeros + nas)
+print(((length(phecodes_frame) - 1) / 2) * nrow(phecodes_frame))
+```
+
+```{r}
+print(length(phecodes_frame) - 1)
+print(nrow(phecode_mapping))
+print(nrow(phecodes_frame))
+print(nrow(bb$get_participants(SOURCE_NAMESPACE, SOURCE_PHENOTYPE_SET)))
+```
+
+```{r}
+bb$list_phenotype_sets("UK_BIOBANK")
+```
+
+```{r}
+TARGET_NAMESPACE
+TARGET_PHENOTYPE_SET_NAME
+```
+
+```{r}
+value_types <- rep_len(c('Categorical (single)', 'Continuous'), length(descriptions))
+head(value_types)
+tail(value_types)
+length(value_types)
+```
+
+
+Upload. Takes a few hours to upload and arrange.
+```{r}
+bb$upload_phenotype_set(
+  namespace = TARGET_NAMESPACE,
+  phenotype_set_name = TARGET_PHENOTYPE_SET_NAME, 
+  note = overall_note, 
+  data = phecodes_frame, 
+  value_type = value_types,
+  description = descriptions,
+  notes = notes, 
+  remove_na = FALSE
+)
+```
+
+
+# 8. Test some example queries
+
+```{r}
+bb$namespace <- TARGET_NAMESPACE
+bb$list_phenotype_sets()
+```
+
+```{r}
+bb$get_phenotype_fields(phenotype_set = TARGET_PHENOTYPE_SET_NAME)
+```
+
+```{r}
+bb$get_phenotype_fields(phenotype_set = TARGET_PHENOTYPE_SET_NAME, name_kw = "renal_failure")
+```
+
+```{r}
+bb$get_phenotype_data(phenotype_set = TARGET_PHENOTYPE_SET_NAME, field_id = c(2204, 2205), minimal = T)
+```
+

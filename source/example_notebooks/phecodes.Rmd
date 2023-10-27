@@ -1,0 +1,410 @@
+---
+title: "Phecode Construction"
+output: html_document
+---
+
+PARADIGM4 INC.
+
+This file is distributed along with the Paradigm4 Enterprise SciDB
+distribution kit and may only be used with a valid Paradigm4 contract
+and in accord with the terms and conditions specified by that contract.
+Copyright (C) 2023 Paradigm4 Inc.
+
+All Rights Reserved.
+
+# 0. About
+
+This notebook illustrates how to assemble a PheCode workflow into a stored 
+Phenotype Set. A quick PheWas example at the end shows how to use the uploaded
+phenotypes.
+
+We've run this notebook once and created the set PHECODE_UKBB_45561
+For example usage, skip to the last section.
+
+# 1. Connect
+
+```{r}
+library(biobank)
+library(data.table)
+```
+
+```{r}
+bb <- connect(
+  host = "127.0.0.1",
+  username = 'scidbadmin',
+  password = rstudioapi::askForPassword(),
+  port = 8083,
+  protocol = "https"
+)
+```
+
+# 2. Setup workspace
+
+```{bash}
+mkdir -p ~/phecodes
+cd ~/phecodes
+wget https://raw.githubusercontent.com/atgu/ukbb_pan_ancestry/master/data/UKB_Phecode_v1.2b1_ICD_Mapping.txt
+```
+
+```{r}
+phecode_mapping = fread('~/phecodes/UKB_Phecode_v1.2b1_ICD_Mapping.txt', colClasses = 'character')
+phecode_mapping
+```
+
+```{r}
+bb$list_phenotype_sets("UK_BIOBANK")
+```
+
+Set the namespace/basket we are constructing PheCodes from and where we will upload them.
+Note you may not have permissions to upload to `UK_BIOBANK` but you can upload to `public`
+
+```{r}
+SOURCE_NAMESPACE = 'UK_BIOBANK'
+SOURCE_PHENOTYPE_SET = 'UKBB_45561'
+
+TARGET_NAMESPACE = 'UK_BIOBANK'
+TARGET_PHENOTYPE_SET_NAME = 'PHECODE_UKBB_45561'
+```
+
+Set which fields we will use. 
+
+```{r}
+# Include primary and secondary causes of death, cancer codes, external causes,
+# and main and secondary diagnoses. Here, rather than including primary and 
+# secondary diagnostic fields individually, we leverage fields 41270 and 41271.
+# These fields aggregate unique ICD codes for each participant from both the 
+# primary and secondary fields.
+ICD10_FIELDS = c(
+  40001, # death primary
+  40002, # death secondary 
+  40006, # cancer
+  41201, # external
+  41270) # diagnoses (primary + secondary)
+ICD9_FIELDS = c(
+  40013, # cancer
+  41271) # diagnoses (primary + secondary)
+```
+
+```{r}
+all_codes <- bb$get_phenotype_data(
+  namespace = SOURCE_NAMESPACE,
+  phenotype_set = SOURCE_PHENOTYPE_SET,
+  field_id = c(ICD10_FIELDS, ICD9_FIELDS),
+  minimal = T # we don't care about linking to dates, so don't need instance/index
+)
+all_codes
+```
+
+
+```{r}
+setDT(all_codes)
+setnames(all_codes, "value", "code")
+all_codes[, field_id := NULL]
+setkey(all_codes, "code")
+all_codes
+```
+
+
+Download the sex data from the namespace
+```{r}
+sex_data_raw = bb$get_phenotype_data(
+  namespace = SOURCE_NAMESPACE,
+  phenotype_set = SOURCE_PHENOTYPE_SET,
+  field_id = c(
+    31,     # Sex
+    22001), # Genetic sex
+  all_eids = T
+)
+setDT(sex_data_raw)
+encoding <- bb$get_encoding(SOURCE_NAMESPACE, encoding_id = 9)
+setDT(encoding)
+sex_data_decoded = encoding[sex_data_raw, c("eid", "field_id", "meaning"), on = "value"]
+sex_data_decoded
+```
+
+```{r}
+unique(phecode_mapping$sex)
+```
+
+```{r}
+sex_data <- dcast(sex_data_decoded, eid ~ field_id, value.var = "meaning")
+sex_data
+```
+
+```{r}
+setnames(sex_data, old = c("31", "22001"), new = c("sex", "genetic_sex"))
+sex_data
+```
+
+
+How many individuals are missing a genetic sex determination?
+```{r}
+table(sex_data$genetic_sex, useNA = 'always')
+```
+
+What are the counts for sex?
+```{r}
+table(sex_data$sex, useNA = "always")
+```
+
+
+How many mismatches are there between sex and genetic sex (for individuals
+for which we have both)?
+
+```{r}
+sex_data[sex != genetic_sex]
+```
+
+```{r}
+sex_data[sex == genetic_sex, agreed_sex := sex]
+```
+
+```{r}
+sex_data[is.na(sex) | is.na(genetic_sex) | sex != genetic_sex]
+```
+
+```{r}
+sex_data
+```
+
+```{r}
+table(sex_data$agreed_sex, useNA = "always")
+```
+
+# 3. Assemble the PheCodes as a data frame
+
+We use the first column for eid (numeric) and add one numeric (1,0,NA) column 
+for each code. When using this method, local RAM usage can be a concern. At 
+~1500 phecodes, the frame uses about 7GB, which is not much for our primary 
+server.
+
+```{r}
+phecodes_frame <- bb$get_participants(
+    namespace= SOURCE_NAMESPACE, 
+    phenotype_set = SOURCE_PHENOTYPE_SET
+)
+setDT(phecodes_frame, key = "eid")
+phecodes_frame
+```
+
+```{r}
+#add cases for each PheCode
+for( i in 1:nrow(phecode_mapping) ) {
+  phecode_id <- phecode_mapping$phecode[i]
+  #initialize all to 0
+  phecodes_frame[, (phecode_id) := 0L]
+  icd_codes <- strsplit(phecode_mapping$icd_codes[i], ",")[[1]]
+  case_data <- all_codes[code %in% icd_codes, eid]
+  phecodes_frame[eid %in% case_data, (phecode_id) := 1L]
+  if (i %% 20 == 0) {
+    print(sprintf("%04d / %04d", i, nrow(phecode_mapping)))
+  }
+}
+```
+
+```{r}
+head(phecodes_frame[, 1:5])
+```
+
+```{r}
+ones <- sum(phecodes_frame[, 2:length(phecodes_frame)], na.rm = T)
+zeros <- sum(1 - phecodes_frame[, 2:length(phecodes_frame)], na.rm = T)
+nas <- sum(is.na(phecodes_frame[, 2:length(phecodes_frame)]))
+print(ones)
+print(zeros)
+print(nas)
+print(ones + zeros + nas)
+print((length(phecodes_frame) - 1) * nrow(phecodes_frame))
+```
+
+exclude sibling PheCode controls (set to NA)
+
+```{r}
+for (i in 1:nrow(phecode_mapping)) {
+  phecode_id <- phecode_mapping$phecode[i]
+  codes_to_exclude <- strsplit(phecode_mapping$exclude_phecodes[i], ",")[[1]]
+  # Build exclusion mask of rows with 1 for any of the codes to exclude
+  mask <- rowSums(phecodes_frame[, ..codes_to_exclude], na.rm = T) > 0 &
+    phecodes_frame[[phecode_id]] == 0L
+  phecodes_frame[mask, (phecode_id) := NA]
+  
+  if (i %% 20 == 0) {
+    print(sprintf("%04d / %04d", i, nrow(phecode_mapping)))
+  }
+}
+```
+
+```{r}
+head(phecodes_frame[, 1:10])
+```
+
+```{r}
+ones <- sum(phecodes_frame[, 2:length(phecodes_frame)], na.rm = T)
+zeros <- sum(1 - phecodes_frame[, 2:length(phecodes_frame)], na.rm = T)
+nas <- sum(is.na(phecodes_frame[, 2:length(phecodes_frame)]))
+print(ones)
+print(zeros)
+print(nas)
+```
+
+exclude males or females from sex-specific PheCodes
+```{r}
+not_female <- sex_data[is.na(agreed_sex) | agreed_sex == "Male", eid]
+not_male <- sex_data[is.na(agreed_sex) | agreed_sex == "Female", eid]
+```
+
+```{r}
+length(not_female)
+length(not_male)
+```
+
+
+```{r}
+for (i in 1:nrow(phecode_mapping)) {
+  if (i %% 20 == 0) {
+    print(sprintf("%04d / %04d", i, nrow(phecode_mapping)))
+  }
+  
+  phecode_id <- phecode_mapping$phecode[i]
+
+  sex_condition = phecode_mapping$sex[i]
+  if (sex_condition == 'both_sexes') {
+    next
+  } else if (sex_condition == 'females') {
+    # Exclude Male and Undetermined participants
+    phecodes_frame[eid %in% not_female, (phecode_id) := NA]
+  } else if (sex_condition == 'males') {
+    # Exclude Female and Undetermined participants
+    phecodes_frame[eid %in% not_male, (phecode_id) := NA]
+  } else {
+    stop(paste("Unexpected sex_condition:", sex_condition))
+  }
+}
+```
+
+```{r}
+ones <- sum(phecodes_frame[, 2:length(phecodes_frame)], na.rm = T)
+zeros <- sum(1 - phecodes_frame[, 2:length(phecodes_frame)], na.rm = T)
+nas <- sum(is.na(phecodes_frame[, 2:length(phecodes_frame)]))
+print(ones)
+print(zeros)
+print(nas)
+```
+
+```{r}
+head(phecodes_frame[, 1:10])
+```
+
+# 4. Upload to the database
+
+```{r}
+titles = colnames(phecodes_frame)[2:ncol(phecodes_frame)]
+head(titles)
+```
+
+```{r}
+all(titles == phecode_mapping$phecode)
+```
+
+```{r}
+titles = gsub('_$', '',
+         gsub('_+', '_',
+         gsub('[^[:alnum:]_]', '_',
+         paste("phc", phecode_mapping$phecode, phecode_mapping$description, sep = "_")
+)))
+head(titles)
+```
+
+```{r}
+max(nchar(titles))
+titles[which.max(nchar(titles))]
+```
+
+```{r}
+setnames(phecodes_frame, c("eid", titles))
+```
+
+```{r}
+head(phecodes_frame[, 1:10])
+```
+
+```{r}
+descriptions = paste0(phecode_mapping$phecode, ": ", phecode_mapping$description)
+notes = paste0('Constructed from ICD 9/10 codes ', phecode_mapping$icd_codes, 
+               ' excluding phecodes ',phecode_mapping$exclude_phecodes)
+```
+
+```{r}
+head(descriptions)
+head(notes)
+```
+
+```{r}
+setDF(phecodes_frame)
+```
+
+```{r}
+overall_note <- paste0('Phecodes generated from ',
+                SOURCE_NAMESPACE, '.', SOURCE_PHENOTYPE_SET, ' fields ',
+                paste0(c(ICD10_FIELDS, ICD9_FIELDS), collapse=','))
+overall_note
+```
+
+```{r}
+ones <- sum(phecodes_frame[2:length(phecodes_frame)], na.rm = T)
+zeros <- sum(1 - phecodes_frame[2:length(phecodes_frame)], na.rm = T)
+nas <- sum(is.na(phecodes_frame[2:length(phecodes_frame)]))
+print(ones)
+print(zeros)
+print(nas)
+print(ones + zeros + nas)
+print((length(phecodes_frame) - 1) * nrow(phecodes_frame))
+```
+
+```{r}
+print(length(phecodes_frame) - 1)
+print(nrow(phecode_mapping))
+print(nrow(phecodes_frame))
+print(nrow(bb$get_participants(SOURCE_NAMESPACE, SOURCE_PHENOTYPE_SET)))
+```
+
+```{r}
+bb$list_phenotype_sets("UK_BIOBANK")
+```
+
+Upload. Takes about 20 min to upload and arrange.
+```{r}
+bb$upload_phenotype_set(
+  namespace = TARGET_NAMESPACE,
+  phenotype_set_name = TARGET_PHENOTYPE_SET_NAME, 
+  note = overall_note, 
+  data = phecodes_frame, 
+  value_type = rep('Categorical (single)', length(descriptions)),
+  description = descriptions,
+  notes = notes, 
+  remove_na = FALSE,
+  use_build = TRUE,
+  build_value = 0
+)
+```
+
+
+# 5 Test some example queries
+
+```{r}
+bb$namespace <- TARGET_NAMESPACE
+bb$list_phenotype_sets()
+```
+
+```{r}
+bb$get_phenotype_fields(phenotype_set = TARGET_PHENOTYPE_SET_NAME)
+```
+
+```{r}
+bb$get_phenotype_fields(phenotype_set = TARGET_PHENOTYPE_SET_NAME, name_kw = "renal_failure")
+```
+
+```{r}
+bb$get_phenotype_data(phenotype_set = TARGET_PHENOTYPE_SET_NAME, field_id = 1102, minimal = T)
+```
+

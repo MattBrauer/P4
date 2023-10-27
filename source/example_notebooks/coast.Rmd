@@ -1,0 +1,137 @@
+---
+title: "COAST example"
+---
+
+Copyright (C) 2023 Paradigm4 Inc.
+All Rights Reserved.
+
+```{r}
+library(biobank)
+bb <- connect(
+  host = "localhost",
+  username = rstudioapi::systemUsername(),
+  password = rstudioapi::askForPassword(),
+  # username = "scidbadmin",
+  # password = readLines("~/.scidb_pass"),
+  port = 8083,
+  protocol = "https"
+)
+```
+
+```{r}
+run_coast <- function(args, list_label, genotypes, covariates, phenotypes, variant_list) {
+  options(warn = 1)
+  stopifnot(all(as.integer(rownames(genotypes)) == phenotypes$eid))
+  stopifnot(all(phenotypes$eid == covariates$eid))
+  stopifnot(all(variant_list$vid == colnames(genotypes)))
+  if (anyNA(phenotypes)) {
+    warning("Omitting NA phenotypes")
+    phenotypes <- na.omit(phenotypes)
+    covariates <- covariates[covariates$eid %in% phenotypes$eid,]
+    genotypes <- genotypes[format(phenotypes$eid, scientific = F),]
+  }
+  if (anyNA(covariates)) {
+    warning("Omitting NA covariates")
+    covariates <- na.omit(covariates)
+    phenotypes <- phenotypes[phenotypes$eid %in% covariates$eid,]
+    genotypes <- genotypes[format(covariates$eid, scientific = F),]
+  }
+  if (anyNA(genotypes)) {
+    warning("Omitting NA genotypes")
+    genotypes <- na.omit(genotypes)
+    geno_eids <- as.numeric(rownames(genotypes))
+    phenotypes <- phenotypes[phenotypes$eid %in% geno_eids,]
+    covariates <- covariates[covariates$eid %in% geno_eids,]
+  }
+  covariates$eid <- NULL
+  covariates$intercept <- 1
+  
+  # Note: You can modify or replace this call, see ?AllelicSeries::COAST() ,
+  # ?AllelicSeries::ASBT() , ?AllelicSeries::ASKAT()
+  result <- AllelicSeries::COAST(
+    anno = variant_list$weight,
+    geno = genotypes,
+    pheno = phenotypes[, 2],
+    covar = covariates
+  )
+  
+  result_df <- as.data.frame(as.list(result))
+  result_df$list_label <- list_label
+  result_df$phenotype <- colnames(phenotypes)[2]
+  return(result_df)
+}
+```
+
+```{r}
+bb$list_phenotype_sets("UK_BIOBANK")
+```
+
+```{r}
+bb$get_phenotype_fields("UK_BIOBANK", "EXAMPLE_GWAS_PHENOS")
+```
+
+
+```{r}
+labels <- bb$get_annotation_frame_list_labels("public", "WES_200K_COAST_annos")
+```
+
+```{r}
+length(labels)
+```
+
+```{r}
+head(labels)
+```
+
+```{r}
+"ENST00000252486" %in% labels #APOE
+```
+
+```{r}
+APOE_vars <- bb$get_annotation_frame("public", "WES_200K_COAST_annos", list_label = "ENST00000252486")
+```
+
+```{r}
+APOE_vars
+```
+
+```{r}
+data.table::setnames(APOE_vars, "coast_anno", "weight")
+APOE_vars
+```
+
+
+```{r}
+gwas_pheno_eids <- bb$get_participants("UK_BIOBANK", phenotype_set = "EXAMPLE_GWAS_PHENOS")$eid
+wb_cov_eids <- bb$get_participants("UK_BIOBANK", phenotype_set = "WHITE_BRITISH_UNRELATED_COVARIATES_45561")$eid
+WES_200K_eids <- bb$get_participants("UKB_200K_WES")$eid
+```
+
+```{r}
+common_eids <- intersect(WES_200K_eids, intersect(gwas_pheno_eids, wb_cov_eids))
+```
+
+```{r}
+length(common_eids)
+```
+
+```{r}
+APOE_res <- bb$map_variant_lists(
+  variant_namespace = "UKB_200K_WES",
+  phenotype_namespace = "UK_BIOBANK",
+  phenotype_set = "EXAMPLE_GWAS_PHENOS",
+  covariate_namespace = "UK_BIOBANK",
+  covariate_phenotype_set = "WHITE_BRITISH_UNRELATED_COVARIATES_45561",
+  variant_lists = APOE_vars,
+  func = run_coast,
+  genotype_format = "dose_matrix",
+  matrix_dose_cutoff = 0
+)
+```
+
+```{r}
+data.table::rbindlist(APOE_res)
+```
+
+As expected, APOE is associated with cholesterol.
+

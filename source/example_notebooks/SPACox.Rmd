@@ -1,0 +1,408 @@
+
+# Setup
+
+```{r}
+library(biobank)
+library(data.table)
+bb <- connect(
+  host = "127.0.0.1",
+  username = 'YOUR_USERNAME', # Change to your username
+  password = rstudioapi::askForPassword(),
+  port = 8083,
+  protocol = "https"
+)
+```
+
+```{r}
+bb$list_namespaces()
+```
+
+```{r}
+WES <- "UK_BIOBANK_470K_WES_LOW_MAF"
+```
+
+
+```{r}
+bb$list_phenotype_sets("public")
+```
+
+```{r}
+bb$get_phenotype_fields("public", "KIDNEY_DECLINE")
+```
+
+```{r}
+kidney_participants <- bb$get_participants(namespace = "public", phenotype_set = "KIDNEY_DECLINE")
+kidney_participants
+```
+
+```{r}
+bb$get_phenotype_data("public", "KIDNEY_DECLINE", minimal = T, field_id = 0)
+```
+
+```{r}
+bb$list_phenotype_sets("UK_BIOBANK")
+```
+
+```{r}
+WES_participants <- bb$get_participants(WES)
+```
+
+```{r}
+WES_and_kidney <- intersect(WES_participants$eid, kidney_participants$eid)
+```
+
+```{r}
+length(WES_participants$eid)
+length(kidney_participants$eid)
+length(WES_and_kidney)
+```
+
+
+# Compile covariates
+
+```{r}
+genetic_sex <- bb$get_phenotype_data("UK_BIOBANK", "UKBB_45561",
+                                     eid = WES_and_kidney,
+                                     field_id = 22001,
+                                     minimal = T,
+                                     value_cast = "int32")
+genetic_sex
+```
+
+```{r}
+setDT(genetic_sex, key = "eid")
+genetic_sex[, field_id := NULL]
+setnames(genetic_sex, "value", "sex")
+genetic_sex
+```
+
+First 10 genetic principal components (up to 40 are available)
+
+```{r}
+genetic_pcs_raw <- bb$get_phenotype_data(
+  "UK_BIOBANK", "UKBB_45561",
+  eid = WES_and_kidney,
+  field_id = 22009,
+  index = 1:10,
+  value_cast = "double"
+)
+setDT(genetic_pcs_raw)
+genetic_pcs_raw
+```
+
+```{r}
+genetic_pcs <- dcast(genetic_pcs_raw, eid ~ index)
+genetic_pcs
+```
+
+```{r}
+anyNA(genetic_pcs)
+```
+
+```{r}
+setnames(genetic_pcs, old = as.character(1:10), new = paste0("pc", 1:10))
+genetic_pcs
+```
+
+
+Using genetic sex and principal components as covariates; feel free to add or change these
+
+```{r}
+covariates <- merge(genetic_sex, genetic_pcs, by = "eid")
+covariates
+```
+
+Select field ids 7:8 here instead for max_t2, status_2
+
+```{r}
+kidney_data_1 <- bb$get_phenotype_data("public", "KIDNEY_DECLINE", field_id = 0:1, value_cast = "int32")
+setDT(kidney_data_1)
+kidney_data_1
+```
+
+```{r}
+kidney_data_1 <- dcast(kidney_data_1, eid ~ title)
+kidney_data_1
+```
+
+```{r}
+anyNA(kidney_data_1)
+```
+
+```{r}
+phenotype_frame_1 <- merge(kidney_data_1, covariates, by = "eid")
+phenotype_frame_1
+```
+
+```{r}
+key(phenotype_frame_1)
+```
+
+```{r}
+final_eids <- phenotype_frame_1$eid
+```
+
+# Fit null model
+
+```{r}
+library(survival)
+library(SPACox)
+null_model <- SPACox_Null_Model(
+  Surv(max_t, status) ~ sex + pc1 + pc2 + pc3 + pc4 + pc5 + pc6 + pc7 + pc8 + pc9 + pc10,
+  data = phenotype_frame_1,
+  pIDs = format(final_eids, scientific = FALSE),
+  gIDs = format(final_eids, scientific = FALSE)
+)
+```
+
+# Get variants
+
+```{r}
+bb$get_variant_fields(WES)
+```
+
+Do some quality control: maf >= 1e-5, f_miss <= 0.2 (slightly less agressive
+than SPACox defaults, since SPACox will re-filter on our subset of the
+population) and hwe_midp >= 1e-10. The filtering settings can be tweaked here
+and inside the SPACox call where `run_spacox` is defined
+
+```{r}
+qc_wes_vars <- bb$get_variants(WES, maf_range = c(1e-5, 1), f_miss_range = c(0, 0.2), hwe_midp_range = c(1e-10, 1))
+```
+
+```{r}
+qc_wes_vars
+```
+
+```{r}
+setDT(qc_wes_vars)
+qc_wes_vars[chrom == 1, .N]
+```
+
+```{r}
+unique(qc_wes_vars$chrom)
+```
+
+# Prep for mvl
+
+Mapping function:
+
+```{r}
+run_spacox <- function(args, label, genos) {
+  stopifnot(all(rownames(genos) == args$null_model$gIDs)) # Check ID match
+  res <- SPACox::SPACox(args$null_model, genos) # Can change parameters of this call if desired (See `?SpaCox` for defaults)
+  dt_res <- data.table::as.data.table(res, keep.rownames = "var_id")
+  filtered_res <- dt_res[!is.na(dt_res$p.value.spa),] # Filter out skipped variants (Comment this out to return MAF and missingness for all variants)
+  return(filtered_res)
+}
+```
+
+
+Batch variants
+
+```{r}
+vars_per_label = 10000
+next_label = 1
+for (chr in 1:22) {
+  vars_in_chr <- qc_wes_vars[chrom == chr, .N] # Count how many vars this chrom has
+  groups <- ceiling(vars_in_chr / vars_per_label) # Count how many labels we'll need
+  labels <- unlist(
+    lapply(next_label:(next_label + groups - 1), function(label) { # For each label we're using for this chrom
+      rep_len(label, vars_per_label) # Repeat the label vars_per_label times
+    }) # Then concatenate them all together (with `unlist`)
+  )[1:vars_in_chr] # And trim the excess off the end
+  qc_wes_vars[chrom == chr, list_label := as.character(labels)] # Set the labels on our list
+  next_label <- next_label + groups # Start the next chromosome at a unique label
+}
+```
+
+```{r}
+qc_wes_vars
+```
+
+```{r}
+qc_wes_vars[, .N, keyby = c("chrom", "list_label")]
+```
+
+```{r}
+test_res <- bb$map_variant_lists(
+  namespace = WES,
+  variant_lists = qc_wes_vars[1:1000],
+  args = list(null_model = null_model),
+  eid = final_eids,
+  genotype_format = "dose_matrix",
+  func = run_spacox
+)
+```
+
+```{r}
+str(test_res)
+```
+
+```{r}
+test_res[["1"]]
+```
+
+Cleanup
+
+```{r}
+rm(list = setdiff(ls(), c("bb", "WES", "qc_wes_vars", "null_model", "final_eids", "run_spacox", "test_res")))
+gc()
+```
+
+
+```{r}
+bigger_test <- bb$map_variant_lists(
+  namespace = WES,
+  variant_lists = qc_wes_vars[list_label %in% 1:10],
+  args = list(null_model = null_model),
+  eid = final_eids,
+  genotype_format = "dose_matrix",
+  func = run_spacox
+)
+```
+
+```{r}
+str(bigger_test)
+```
+
+```{r}
+ordered_res <- bigger_test[order(as.integer(names(bigger_test)))]
+```
+
+```{r}
+names(ordered_res)
+```
+
+```{r}
+complete_test_res <- rbindlist(ordered_res)
+complete_test_res
+```
+
+Only got back ~17,000 / 100,000 -- a good number of variants are failing the MAF
+QC on the smaller population.
+
+
+```{r}
+full_res <- bb$map_variant_lists(
+  namespace = WES,
+  variant_lists = qc_wes_vars,
+  args = list(null_model = null_model),
+  eid = final_eids,
+  genotype_format = "dose_matrix",
+  func = run_spacox
+)
+```
+
+
+```{r}
+ordered_res <- full_res[order(as.integer(names(full_res)))]
+complete_res <- rbindlist(ordered_res)
+complete_res
+```
+
+```{r}
+all.equal(complete_res[1:16921, ], complete_test_res)
+```
+
+```{r}
+complete_res[, c("chrom", "pos", "ref", "alt") := tstrsplit(var_id, ":")]
+```
+
+```{r}
+complete_res
+```
+
+```{r}
+complete_res[, chrom := as.integer(chrom)]
+complete_res[, pos := as.integer(pos)]
+setkey(complete_res, chrom, pos, ref, alt)
+setcolorder(complete_res)
+complete_res
+```
+
+```{r}
+setnames(complete_res, function(old_names) {gsub(".", "_", old_names, fixed = T)})
+complete_res
+```
+
+# Plot result
+
+```{r}
+qqman::qq(complete_res$p_value_spa)
+```
+
+```{r}
+qqman::manhattan(complete_res, chr = "chrom", bp = "pos", p = "p_value_spa", snp = "var_id")
+```
+
+# Upload result
+
+```{r}
+attributes <- colnames(complete_res)[6:12]
+```
+
+```{r}
+attributes
+```
+
+```{r}
+attr_to_load <- sapply(attributes, function(x) {return("double")}, simplify = F, USE.NAMES = TRUE)
+attr_to_load
+```
+
+```{r}
+bb$create_faceted_association_set("public", "SPACox_example",
+  note = "SPACox analysis of max_t and status from public.KIDNEY_DECLINE against variants from UK_BIOBANK_470K_WES_LOW_MAF",
+  phenotypes = "kidney_decline_1",
+  variants = complete_res[, .(chrom, pos, ref, alt)],
+  variant_namespace = "UK_BIOBANK_470K_WES_LOW_MAF",
+  attributes = attr_to_load
+)
+```
+
+```{r}
+bb$get_phenotype_fields("public", association_set = "SPACox_example")
+```
+
+```{r}
+to_load <- copy(complete_res)
+to_load[, var_id := NULL]
+to_load[, phenotype := "kidney_decline_1"]
+```
+
+```{r}
+to_load
+```
+
+```{r}
+setDF(to_load)
+```
+
+
+```{r}
+bb$upload_association_data("public", "SPACox_example", to_load, verbose = T, allow_new_facets = T)
+```
+
+
+```{r}
+bb$list_association_sets("public")
+```
+
+# Example queries
+
+```{r}
+bb$get_association_data("public", "SPACox_example", chrom = 22)
+```
+
+
+```{r}
+bb$get_association_data("public", "SPACox_example", p_value_spa_range = c(0, 1e-5))
+```
+
+```{r}
+bb$list_annotation_frames("UK_BIOBANK")
+```
+
+
+

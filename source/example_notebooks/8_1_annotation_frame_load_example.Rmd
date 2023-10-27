@@ -1,0 +1,137 @@
+---
+title: "Paradigm4 Training Notebook: Loading Annotation Frames"
+output: html_document
+---
+
+PARADIGM4 INC.
+
+This file is distributed along with the Paradigm4 Enterprise SciDB 
+distribution kit and may only be used with a valid Paradigm4 contract 
+and in accord with the terms and conditions specified by that contract.
+
+Copyright (C) 2010 - 2021 Paradigm4 Inc.
+All Rights Reserved.
+
+
+In this notebook, we show the process of loading a small new annotation frame. 
+For questions, write to us at maze_support@paradigm4.com
+
+# 0. Connecting 
+```{r}
+library(biobank)
+```
+
+```{r}
+bb <- connect(
+  host = "127.0.0.1",
+  username = 'scidbadmin',                #<<--- replace with your username
+  password = rstudioapi::askForPassword(),
+  port = 8083,
+  protocol = "https")
+bb$namespace='UK_BIOBANK'
+```
+
+# 1. Prepare Annotation Frame Fields
+
+In this example, we'll create a new annotation frame based on the VEP+LOFTEE annotation frames loaded previously.
+
+Annotation frames need a special "list_label" column that will be used to organized lists of variants, such that a variant can belong to multiple lists.
+
+In this case we decided to use the "chrom" field as the list label. We list all the other columns at frame creation time.
+
+Here we create the data.frame of columns (fields) and their types (excluding chrom,pos,ref,alt and list_label)
+```{r}
+#everything except chrom,pos,ref,alt 
+fields = data.frame(
+  name = c('has_canonical_transcript', 'num_transcripts'),
+  type = c('string', 'double'),
+  note = c('Whether or not the variant is associated with a canonical transcript', 'number of transcripts the variant is associated with')
+)
+fields
+```
+
+# 2. Create Annotation Frame
+This one is already created but you can use another name. As with all data writes, your account will need permissions to write to this namespace.
+```{r}
+bb$create_annotation_frame(
+  namespace = 'public', 
+  annotation_frame_name = 'UK_BIOBANK_VEP_LOFTEE_20210504_METADATA_DEMO', 
+  fields = fields, 
+  note = 'P4 Example', 
+  variant_namespace = 'UK_BIOBANK'
+)
+```
+
+List the frames in the namespace
+```{r}
+bb$list_annotation_frames(namespace = 'public')
+```
+
+# 3. Generate some annotation
+```{r}
+vars_22 = bb$get_variants(namespace = "UK_BIOBANK", chromosome = 22)
+vars_22
+```
+
+Variants which don't appear in VEP_LOFTEE_20210504 don't have an entry with CANONICAL=YES in the VEP output
+```{r}
+vars_22_in_VEP_LOFTEE_20210504 = bb$get_annotation_frame(namespace = "UK_BIOBANK", 
+                                                         annotation_frame = "VEP_LOFTEE_20210504",
+                                                         variant_list = vars_22,
+                                                         fields = c())
+vars_22_in_VEP_LOFTEE_20210504 = unique(vars_22_in_VEP_LOFTEE_20210504[,c("chrom", "pos", "ref", "alt")])
+vars_22_in_VEP_LOFTEE_20210504$has_canonical_transcript = "yes"
+```
+
+```{r}
+new_annotation = merge(vars_22, vars_22_in_VEP_LOFTEE_20210504, by=c("chrom", "pos", "ref", "alt"), all.x = T)
+new_annotation$has_canonical_transcript[is.na(new_annotation$has_canonical_transcript)] = "no"
+new_annotation
+```
+Now we can use an aggregate to get the number of times each variant appears in the VEP_LOFTEE_20210504_FULL - which, since the list_label for that annotation frame is the transcript, is the number of associated transcripts.
+```{r}
+vars_22_transcript_counts = bb$get_annotation_frame(namespace = "UK_BIOBANK", 
+                                                    annotation_frame = "VEP_LOFTEE_20210504_FULL",
+                                                    variant_list = vars_22, 
+                                                    aggregate = "count(*)", 
+                                                    group_by = c("chrom", "pos", "ref", "alt"))
+vars_22_transcript_counts
+```
+```{r}
+new_annotation = merge(new_annotation, vars_22_transcript_counts, by=c("chrom", "pos", "ref", "alt"))
+colnames(new_annotation) = c("chrom","pos","ref","alt","has_canonical_transcript","num_transcripts")
+new_annotation$list_label = "22"
+new_annotation
+```
+Note that chrom, pos, and any annotation frame fields defined as type 'double' must be 'numeric', and all other fields must be of type 'character'
+```{r}
+sapply(new_annotation, class)
+```
+
+
+# 4. Load annotation frame
+
+```{r}
+bb$load_annotation_frame(namespace = "public", 
+                         annotation_frame = "UK_BIOBANK_VEP_LOFTEE_20210504_METADATA_DEMO", 
+                         data = new_annotation)
+```
+
+This load can be additive - you could generate that annotation for a different chromosome and add it the the annotation we've just loaded.  However, any data for the same chrom,pos,ref,alt combinations will be overwritten with new data, though this would not be an issue in this case since we've split variant loads by chromosome and we don't have variants in multiple lists.
+
+```{r}
+bb$list_annotation_frames("public")
+```
+We could use this annotation frame to ask something like "Which variants are associated with at least 10 transcripts, but none of them are canonical?"
+```{r}
+bb$get_annotation_frame(namespace = "public", 
+                        annotation_frame = "UK_BIOBANK_VEP_LOFTEE_20210504_METADATA_DEMO", 
+                        has_canonical_transcript = "no", 
+                        num_transcripts_range = c(10,NA)
+                        )
+```
+
+# 5. (Optional) Delete Annotation Frame
+```{r}
+# bb$delete_annotation_frame(namespace = 'public', annotation_frame = 'UK_BIOBANK_VEP_LOFTEE_20210504_METADATA_DEMO')
+```

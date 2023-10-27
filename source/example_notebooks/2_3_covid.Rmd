@@ -1,0 +1,186 @@
+---
+title: "Paradigm4 Training Notebook: Covid-19 Test Data"
+output: html_document
+---
+
+PARADIGM4 INC.
+
+This file is distributed along with the Paradigm4 Enterprise SciDB 
+distribution kit and may only be used with a valid Paradigm4 contract 
+and in accord with the terms and conditions specified by that contract.
+
+Copyright (C) 2010 - 2021 Paradigm4 Inc.
+All Rights Reserved.
+
+# 0. Intro
+
+This notebook covers some example queries using COVID-19 test data.  Note that no data is currently loaded.
+
+The UKBB data format, and therefore the API interface described in this notebook, may change in the future.
+
+For any questions, please write to us at maze_support@paradigm4.com
+
+# 1. Make a SciDB connection
+```{r}
+library(biobank)
+```
+
+```{r}
+bb <- connect(
+  host = "127.0.0.1",
+  username = 'scidbadmin',
+  password = rstudioapi::askForPassword(),
+  port = 8083,
+  protocol = "https")
+bb$namespace='UK_BIOBANK'
+```
+
+# 2. Query COVID test data
+
+```{r}
+covid_tests = bb$get_covid_data(namespace = 'UK_BIOBANK')
+head(covid_tests)
+```
+
+Each entry in this result is a "test event". Note there are multiple tests per individual
+```{r}
+nrow(covid_tests)
+```
+
+As of the first batch, there were, on average, about two tests conducted for each person. This is the number of unique individuals:
+```{r}
+length(unique(covid_tests$eid))
+```
+
+We can extract the list individuals who tested positive at least once:
+```{r}
+covid19_positive_eid = unique(subset(covid_tests, result==1)$eid)
+length(covid19_positive_eid)
+head(covid19_positive_eid)
+```
+
+
+# 3. Extract Phenotypic Data for these Individuals
+
+We can pull phenotypic data for these individuals. Let's find the "age at recruitment" field
+```{r}
+bb$get_phenotype_fields('UK_BIOBANK', 'UKBB_45561', name_kw='age at recruitment')
+```
+
+And extract
+```{r}
+covid_age_at_recruitment = bb$get_phenotype_data('UK_BIOBANK', 'UKBB_45561', 
+                                                 field_id=21022, 
+                                                 eid=covid19_positive_eid,
+                                                 value_cast='double')
+head(covid_age_at_recruitment)
+```
+
+```{r}
+hist(covid_age_at_recruitment$value, breaks = 30, col='blue')
+```
+
+# 4. Query Diagnoses
+
+The field 41270 has all the ICD10 diagnoses - primary and secondary. We can extract all diagnoses for these people:
+```{r}
+covid19_icd10 = bb$get_phenotype_data('UK_BIOBANK', 'UKBB_45561', field_id=41270, 
+                                      eid=covid19_positive_eid)
+head(covid19_icd10)
+```
+
+Look at the 20 most common diagnoses:
+```{r}
+top_20_icd10= head(sort(table(covid19_icd10$value), decreasing = T), n=20)
+top_20_icd10
+```
+
+Convert codes to meanings and look at their counts in the total population
+```{r}
+icd10_meanings = bb$get_icd10(namespace = 'UK_BIOBANK', code=names(top_20_icd10))
+icd10_meanings$total_count = rowSums(icd10_meanings[,3:ncol(icd10_meanings)], na.rm=T)
+icd10_meanings= icd10_meanings[c('coding', 'meaning', 'total_count')]
+icd10_meanings= icd10_meanings[order(icd10_meanings$total_count, decreasing = T), ]
+icd10_meanings
+```
+
+# 5. Query Clinical Records
+
+Get the clinical records for these individuals
+```{r}
+clinical_records = bb$get_gp_clinical(namespace = 'UK_BIOBANK', eid = covid19_positive_eid)
+head(clinical_records)
+```
+
+Query Medication data.
+Here we use `aggregate` to create a unique entry for each eid/drug pair
+```{r}
+scripts = bb$get_gp_scripts(namespace = 'UK_BIOBANK', eid = covid19_positive_eid,
+                            aggregate="count(*)", group_by=c("eid", "drug_name"))
+head(scripts)
+```
+
+```{r}
+common_drugs = data.frame( table(scripts$drug_name))
+colnames(common_drugs) = c('drug_name', 'num_eids')
+head(common_drugs[order(common_drugs$num_eids, decreasing = T), ], n=10)
+```
+
+# 6. Other Examples
+
+Note you can use the `eid` argument in `bb$get_genotypes`. You can also convert testing positive for COVID-19 to a phenotype and run an association job - though the sample size may be too small for a meaningful result. We expect that the test data will be updated regularly with more test results, at which point such analyses should become more meaningful.
+
+Reach out to maze_support@paradigm4.com with any questions!
+
+
+# X. Admin Section
+
+## 1. The test data
+These commands are for admin use only.
+
+To load COVID-19 data, as an admin user on the server. Put the covid19.txt file in a directory like '~/covid' and load like so:
+```{r}
+bb$load_covid_data(namespace = 'UK_BIOBANK', directory = '~/covid')
+```
+
+
+## 2. The MISC blood group data
+
+This should only need to be done once. To load the COVID-19 MISC table (blood group information), read in the covid19_misc.txt file:
+```{r}
+misc_data = data.table::fread('~/covid/covid19_misc.txt')
+misc_data$eid = as.numeric(misc_data$eid)
+misc_data$blood_group = as.character(misc_data$blood_group)
+misc_data
+```
+
+And load it as a phenotype set:
+```{r}
+bb$upload_phenotype_set(
+  namespace = 'UK_BIOBANK',
+  phenotype_set_name = 'COVID19_MISC', 
+  data = data.frame(misc_data), 
+  value_type = 'Categorical (single)', 
+  description = 'Blood group from the COVID19_MISC file',
+  note = 'Covid-19 Misc data (blood group information), uploaded by... YOUR_USER_NAME 1/1/14 ...'
+)
+```
+
+### Check the set
+```{r}
+bb$list_phenotype_sets('UK_BIOBANK')
+```
+
+```{r}
+bb$get_phenotype_fields('UK_BIOBANK', 'COVID19_MISC')
+```
+
+### Get the blood group data
+```{r}
+bb$get_phenotype_data('UK_BIOBANK', 'COVID19_MISC', title='blood_group')
+```
+
+### Delete the set, if needed
+```{r}
+# bb$delete_phenotype_set(namespace = 'UK_BIOBANK', phenotype_set = 'COVID19_MISC')
+```

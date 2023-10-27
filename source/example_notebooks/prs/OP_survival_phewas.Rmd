@@ -1,0 +1,307 @@
+---
+title: "Perform Cox PH analysis of a PheCode against OmicsPred Metabolon PGS scores"
+output: html_document
+---
+
+BEGIN_COPYRIGHT
+
+PARADIGM4 INC.
+This file is distributed along with the Paradigm4 Enterprise SciDB 
+distribution kit and may only be used with a valid Paradigm4 contract 
+and in accord with the terms and conditions specified by that contract.
+
+Copyright (C) 2010 - 2023 Paradigm4 Inc.
+All Rights Reserved.
+
+END_COPYRIGHT
+
+# Connect to biobank
+
+```{r setup}
+library(biobank)
+library(data.table)
+library(survival)
+bb <- connect(
+  host = "127.0.0.1",
+  username = 'dgealow',
+  password = rstudioapi::askForPassword(),
+  port = 8083,
+  protocol = "https"
+)
+```
+
+
+```{r}
+bb$list_phenotype_sets("UK_BIOBANK")
+```
+
+```{r}
+bb$list_phenotype_sets("public")
+```
+
+# Download data
+
+## Covariates
+
+### Genotyping array
+
+```{r}
+bb$get_phenotype_fields("UK_BIOBANK", "UKBB_45561", name_kw = "batch")
+```
+
+
+```{r}
+gt_array <- bb$get_phenotype_data(
+  "UK_BIOBANK",
+  "UKBB_45561",
+  field_id = 22000,
+  value_cast = "double",
+  minimal = TRUE
+)
+```
+
+```{r}
+setDT(gt_array, key = "eid")
+gt_array
+```
+
+```{r}
+anyNA(gt_array)
+```
+
+```{r}
+gt_array[, field_id := NULL]
+gt_array[value > 0, array := 1L]
+gt_array[value < 0, array := 0L]
+```
+
+```{r}
+gt_array
+```
+
+```{r}
+gt_array[, value:= NULL]
+```
+
+### sex and genetic PCs
+
+```{r}
+bb$get_phenotype_fields("UK_BIOBANK", "WHITE_BRITISH_UNRELATED_COVARIATES_45561")
+```
+
+```{r}
+sex_and_PCs <- bb$get_phenotype_data(
+  "UK_BIOBANK",
+  "WHITE_BRITISH_UNRELATED_COVARIATES_45561",
+  field_id = 1:11,
+  value_cast = "double"
+)
+```
+
+```{r}
+setDT(sex_and_PCs)
+sex_and_PCs
+```
+
+```{r}
+anyNA(sex_and_PCs)
+```
+
+```{r}
+sex_and_PCs <- dcast(sex_and_PCs, eid ~ title)
+sex_and_PCs
+```
+
+```{r}
+setnames(sex_and_PCs, old = paste0("pcomp_", 1:10), new = paste0("pc", 1:10))
+```
+
+```{r}
+anyNA(sex_and_PCs)
+```
+
+### Merge together
+
+```{r}
+covariates <- merge(gt_array, sex_and_PCs, by = "eid")
+setcolorder(covariates, c("eid", "sex", "array", paste0("pc", 1:10)))
+covariates
+```
+
+```{r}
+covariates[, sex := as.integer(sex)]
+```
+
+```{r}
+anyNA(covariates)
+```
+
+
+## Phecode
+
+```{r}
+phecode_fields <- bb$get_phenotype_fields("UK_BIOBANK", "PHECODE_WITH_AGES_UKBB_45561")
+```
+
+```{r}
+phecode_fields
+```
+
+Let's take chronic kidney disease as an example.
+
+```{r}
+bb$get_phenotype_fields("UK_BIOBANK", "PHECODE_WITH_AGES_UKBB_45561", name_kw = "CKD")
+```
+
+```{r}
+phecode_field_id <- 2204
+```
+
+```{r}
+phecode_data <- bb$get_phenotype_data(
+  "UK_BIOBANK",
+  "PHECODE_WITH_AGES_UKBB_45561",
+  field_id = c(phecode_field_id, phecode_field_id + 1),
+  value_cast = "double",
+  minimal = TRUE
+)
+```
+
+```{r}
+setDT(phecode_data)
+phecode_data
+```
+
+```{r}
+phecode_data <- dcast(phecode_data, eid ~ field_id)
+phecode_data
+```
+
+```{r}
+phecode_data[is.na(`2204`) != is.na(`2205`)]
+```
+
+```{r}
+phecode_data <- na.omit(phecode_data)
+phecode_data
+```
+
+```{r}
+setnames(phecode_data, old = as.character(c(phecode_field_id, phecode_field_id + 1)), new = c("phe", "age"))
+phecode_data[, phe := as.integer(phe)]
+```
+
+```{r}
+phecode_data
+```
+
+```{r}
+all_pheno <- merge(phecode_data, covariates, by = "eid")
+all_pheno
+```
+
+
+## OmicsPred
+
+```{r}
+op_fields <- bb$get_phenotype_fields("public", "OmicsPred")
+```
+
+```{r}
+setDT(op_fields)
+metabolon_fields <- op_fields[grepl("metab", description, ignore.case = T)]
+metabolon_fields
+```
+
+Clean up to save memory.
+*WARNING*: this will delete any other objects you have in your environment!
+```{r}
+#do.call(rm, as.list(setdiff(ls(), c("metabolon_fields", "all_pheno", "bb"))))
+```
+
+```{r}
+cat("Starting...\n")
+start_time <- proc.time()
+score <- lapply(metabolon_fields$title, function(title){
+  cat(sprintf("\rRunning %s ; %.1f min elapsed", title, (proc.time() - start_time)["elapsed"]/60))
+  
+  # Download and munge OmicsPred PGS score
+  pgs_data <- bb$get_phenotype_data("public", "OmicsPred", title = title, value_cast = "double", minimal = T)
+  setDT(pgs_data, key = "eid")
+  pgs_data[, field_id := NULL]
+  setnames(pgs_data, "value", "op_score")
+  
+  # Merge data together
+  all_data <- merge(pgs_data, all_pheno, by = "eid")
+  if (anyNA(all_data)) stop("NAs in all_data")
+  
+  # Normalize and adjust data
+  all_data[, eid := NULL] # don't need EID anymore
+  cols_to_scale <- c("op_score", paste0("pc", 1:10))
+  setcolorder(all_data, cols_to_scale)
+  ## Center and scale score and PCs
+  scaled_cols <- as.data.table(scale(all_data[, ..cols_to_scale]))
+  all_data[, (cols_to_scale) := scaled_cols]
+  ## Adjust score for PCs
+  score_lm <- lm(
+    paste("op_score ~", paste0("pc", 1:10, collapse = " + ")),
+    all_data
+  )
+  all_data[, op_score := score_lm$residuals]
+  ## Normalize score again
+  all_data[, op_score := scale(op_score)]
+  
+  # Perform Cox PH regression
+  fit <- coxph(
+    Surv(age, phe) ~ op_score +
+           pc1 + pc2 + pc3 + pc4 + pc5 + pc6 + pc7 + pc8 + pc9 + pc10 +
+           array + strata(sex),
+    all_data
+  )
+  summ <- summary(fit)
+  stopifnot(summ$coefficients["op_score", "exp(coef)"] == summ$conf.int["op_score", "exp(coef)"])
+  return(data.table(
+    trait = title,
+    hr = summ$coefficients["op_score", "exp(coef)"],
+    hr_low = summ$conf.int["op_score", "lower .95"],
+    hr_high = summ$conf.int["op_score", "upper .95"],
+    pvalue = summ$coefficients["op_score", "Pr(>|z|)"]
+  ))
+})
+end_time <- proc.time()
+cat("\nDone!\n")
+```
+
+```{r}
+scores_dt <- rbindlist(scores)
+```
+
+```{r}
+scores_dt
+```
+
+```{r}
+scores_dt[order(pvalue)]
+```
+
+Write out the scores to a file
+(commented to avoid accidental clobber)
+```{r}
+#fwrite(scores_dt, "/staging/omicspred_phewas/phc_585.3.csv")
+```
+
+```{r}
+end_time - start_time
+```
+
+```{r}
+(end_time - start_time)["elapsed"] / 60
+```
+
+Took about 98 minutes to run.
+
+```{r}
+qqman::qq(scores_dt$pvalue)
+```
+
+

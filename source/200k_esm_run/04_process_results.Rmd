@@ -1,0 +1,265 @@
+---
+title: "Process VEP results, and upload to SciDB"
+output: html_document
+---
+
+PARADIGM4 INC.
+
+This file is distributed along with the Paradigm4 Enterprise SciDB 
+distribution kit and may only be used with a valid Paradigm4 contract 
+and in accord with the terms and conditions specified by that contract.
+
+Copyright (C) 2023 Paradigm4 Inc.
+All Rights Reserved.
+
+# Setup
+
+```{r}
+library(data.table)
+library(biobank)
+```
+
+```{r}
+bb <- connect(
+  host = "127.0.0.1",
+  username = "scidbadmin",
+  password = rstudioapi::askForPassword(),
+  port = 8083,
+  protocol = "https"
+)
+```
+
+# Prepare annotation frames and load the first part of the data
+
+```{r}
+data <- fread("output/UK_BIOBANK_470K_WES_LOW_MAF_vep_output_part_00.tsv",
+             sep = "\t", na.strings = "-")
+```
+
+```{r}
+setnames(data, old = c("#Uploaded_variation", "REF_ALLELE", "Allele", "Feature"),
+         new = c("Uploaded_variation", "ref", "alt", "Transcript"))
+id <- tstrsplit(data$Uploaded_variation, "_", fixed = T)
+data[, chrom := as.double(id[[1]])]
+if (anyNA(data$chrom)) stop("chrom is NA")
+data[, pos := as.double(id[[2]])]
+if (anyNA(data$pos)) stop("pos is NA")
+data[, DISTANCE := as.double(DISTANCE)]
+data[, STRAND := as.double(STRAND)]
+# Break out the worst consequence into a separate field for easier querying
+data[, worst_consequence := tstrsplit(Consequence, ",")[[1]]]
+if (any(!is.na(data$CHECK_REF))) stop("CHECK_REF not NA")
+data[, CHECK_REF := NULL] # Completely NA
+if (any(data$Feature_type != "Transcript")) stop("Feature_type not 'Transcript'")
+data[, Feature_type := NULL] # "Transcript" for every row
+data[, Uploaded_variation := NULL] # Redundant
+data[, Location := NULL] # Redundant
+setcolorder(data, c("chrom", "pos", "ref", "alt", "Gene", "Transcript", "worst_consequence"))
+data
+```
+
+```{r}
+mane_select <- data[!is.na(MANE_SELECT)]
+mane_select
+```
+
+```{r}
+setnames(data, "Transcript", "list_label")
+setcolorder(data, c("list_label", "chrom", "pos", "ref", "alt", "Gene", "worst_consequence"))
+colnames(data)
+```
+
+```{r}
+mane_all <- data[!(is.na(MANE_SELECT) & is.na(MANE_PLUS_CLINICAL))]
+mane_all
+```
+
+```{r}
+field_names <- colnames(data)
+field_types <- sapply(data, function(x) {
+  if (typeof(x) == "character") {
+    return("string")
+  } else if (typeof(x) == "double") {
+    return("double")
+  } else {
+    stop("wrong type")
+  }
+})
+
+fields <- data.table(name = field_names, type = field_types)
+fields
+```
+
+```{r}
+fields <- fields[6:nrow(fields),]
+fields
+```
+
+```{r}
+setDF(fields)
+WES <-"UK_BIOBANK_470K_WES_LOW_MAF"
+bb$create_annotation_frame(namespace = WES, annotation_frame_name = "vep_annotations_all", fields = fields, note = "VEP annotations (including LOFTEE and REVEL) for all transcripts. List label is Ensembl transcript ID.")
+bb$create_annotation_frame(namespace = WES, annotation_frame_name = "vep_annotations_mane", fields = fields, note = "VEP annotations (including LOFTEE and REVEL) for MANE Select and MANE Plus Clinical transcripts. List label is Ensembl transcript ID.")
+```
+
+```{r}
+if (any(!is.na(mane_select$MANE_PLUS_CLINICAL))) stop()
+mane_select[, MANE_PLUS_CLINICAL := NULL]
+```
+
+```{r}
+setnames(mane_select, "Gene", "list_label")
+mane_select
+```
+
+```{r}
+mane_names <- colnames(mane_select)
+mane_types <- sapply(mane_select, function(x) {
+  if (typeof(x) == "character") {
+    return("string")
+  } else if (typeof(x) == "double") {
+    return("double")
+  } else {
+    stop("wrong type")
+  }
+})
+
+mane_fields <- data.table(name = mane_names, type = mane_types)
+mane_fields
+```
+
+```{r}
+mane_fields <- mane_fields[6:nrow(mane_fields)]
+setDF(mane_fields)
+mane_fields
+```
+
+```{r}
+bb$create_annotation_frame(namespace = WES, annotation_frame_name = "vep_annotations_mane_select", fields = mane_fields, note = "VEP annotations (including LOFTEE and REVEL) for only the MANE Select transcript for each gene. List label is Ensembl gene ID.")
+```
+
+```{r}
+setDF(data)
+bb$load_annotation_frame(namespace = WES, annotation_frame = "vep_annotations_all", data = data)
+```
+
+```{r}
+setDF(mane_all)
+bb$load_annotation_frame(namespace = WES, annotation_frame = "vep_annotations_mane", data = mane_all)
+```
+
+```{r}
+setDF(mane_select)
+bb$load_annotation_frame(namespace = WES, annotation_frame = "vep_annotations_mane_select", data = mane_select)
+```
+
+# Load the rest of the data
+
+```{r}
+process_part <- function(idx) {
+  print(sprintf("Processing part %02d", idx))
+  filename <- sprintf("output/UK_BIOBANK_470K_WES_LOW_MAF_vep_output_part_%02d.tsv", idx)
+  data <- fread(filename, sep = "\t", na.strings = "-")
+  
+  setnames(data, old = c("#Uploaded_variation", "REF_ALLELE", "Allele", "Feature"),
+           new = c("Uploaded_variation", "ref", "alt", "Transcript"))
+  id <- tstrsplit(data$Uploaded_variation, "_", fixed = T)
+  data[, chrom := as.double(id[[1]])]
+  if (anyNA(data$chrom)) stop("chrom is NA")
+  data[, pos := as.double(id[[2]])]
+  if (anyNA(data$pos)) stop("pos is NA")
+  data[, DISTANCE := as.double(DISTANCE)]
+  data[, STRAND := as.double(STRAND)]
+  # Break out the worst consequence into a separate field for easier querying
+  data[, worst_consequence := tstrsplit(Consequence, ",")[[1]]]
+  if (any(!is.na(data$CHECK_REF))) stop("CHECK_REF not NA")
+  data[, CHECK_REF := NULL] # Completely NA
+  if (any(data$Feature_type != "Transcript", na.rm = T)) stop("Feature_type not 'Transcript'")
+  if (!all(data[is.na(Feature_type), Consequence == "intergenic_variant" & is.na(Transcript) & is.na(Gene)])) {
+    stop("Intergenic not as expected for NA Feature_type")
+  }
+  data[, Feature_type := NULL] # "Transcript" for every row
+  data[, Uploaded_variation := NULL] # Redundant
+  data[, Location := NULL] # Redundant
+  
+  mane_select <- data[!is.na(MANE_SELECT)]
+  
+  setnames(data, "Transcript", "list_label")
+  mane_all <- data[!(is.na(MANE_SELECT) & is.na(MANE_PLUS_CLINICAL))]
+  if (anyNA(mane_all$list_label)) stop("NA list_label for mane_all")
+  
+  if (!all(data[is.na(list_label), Consequence == "intergenic_variant" & is.na(Gene)])) {
+    stop("Intergenic not as expected for empty list label")
+  }
+  data[is.na(list_label), list_label := "intergenic"]
+  
+  if (any(!is.na(mane_select$MANE_PLUS_CLINICAL))) stop("Data for both MANE fields")
+  mane_select[, MANE_PLUS_CLINICAL := NULL]
+  setnames(mane_select, "Gene", "list_label")
+  if (anyNA(mane_select$list_label)) stop("NA list_label for mane_select")
+  
+  setDF(data)
+  bb$load_annotation_frame(namespace = WES, annotation_frame = "vep_annotations_all", data = data)
+  print("loaded unfiltered")
+  setDF(mane_all)
+  bb$load_annotation_frame(namespace = WES, annotation_frame = "vep_annotations_mane", data = mane_all)
+  print("loaded mane_all")
+  setDF(mane_select)
+  bb$load_annotation_frame(namespace = WES, annotation_frame = "vep_annotations_mane_select", data = mane_select)
+  print("loaded mane_select")
+}
+```
+
+```{r}
+rm(data, mane_all, mane_select, fields, id, mane_fields)
+gc()
+```
+
+
+```{r}
+for (idx in 1:95) {
+  process_part(idx)
+}
+```
+
+# Check that uploads were successful
+
+Reconnect as user
+```{r}
+bb <- connect(
+  host = "127.0.0.1",
+  username = "dgealow",
+  password = rstudioapi::askForPassword(),
+  port = 8083,
+  protocol = "https"
+)
+```
+
+```{r}
+bb$get_annotation_frame_fields(WES, "vep_annotations_all")
+```
+
+```{bash}
+head input/UK_BIOBANK_470K_WES_LOW_MAF_vep_input_part_00
+```
+
+```{r}
+bb$get_annotation_frame(WES, "vep_annotations_all",
+                        chrom = 1,
+                        pos = 1054382)
+```
+
+```{r}
+bb$get_annotation_frame(WES, "vep_annotations_all", list_label = "ENST00000688131")
+```
+
+```{r}
+bb$get_annotation_frame(WES, "vep_annotations_mane_select",
+                        chrom = 1,
+                        pos = 1054382)
+```
+
+```{r}
+bb$get_annotation_frame(WES, "vep_annotations_mane_select",
+                        LoF = "HC")
+```

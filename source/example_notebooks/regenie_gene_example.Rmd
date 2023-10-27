@@ -1,0 +1,203 @@
+---
+title: "Paradigm4 Training Notebook: Gene-based GWAS with regenie"
+output: html_document
+---
+
+PARADIGM4 INC.
+
+This file is distributed along with the Paradigm4 Enterprise SciDB 
+distribution kit and may only be used with a valid Paradigm4 contract 
+and in accord with the terms and conditions specified by that contract.
+
+Copyright (C) 2023 Paradigm4 Inc.
+All Rights Reserved.
+
+# Load libraries and connect to biobank
+
+```{r}
+library(biobank)
+library(data.table)
+```
+
+```{r}
+bb <- connect(
+  host = "127.0.0.1",
+  username = 'dgealow', # <- your username
+  password = rstudioapi::askForPassword(),
+  port = 8083,
+  protocol = "https"
+)
+```
+
+```{r}
+bb$list_namespaces()
+```
+
+```{r}
+UKB <- "UK_BIOBANK"
+WES <- "UK_BIOBANK_470K_WES_LOW_MAF"
+```
+
+# Build a phenotype set with the phenotypes of interest
+
+```{r}
+bb$list_phenotype_sets(UKB)
+```
+
+```{r}
+bb$get_phenotype_fields(UKB, "UKBB_45561",
+                        name_kw = "creatinine")
+```
+
+```{r}
+bb$get_phenotype_fields(UKB, "UKBB_45561",
+                        field_id_prefix = 30700)
+```
+
+```{r}
+creatinine_data <- bb$get_phenotype_data(UKB, "UKBB_45561",
+                                         field_id = 30700,
+                                         instance = 0, # Initial assessment center visit
+                                         minimal = TRUE)
+creatinine_data
+```
+
+```{r}
+setDT(creatinine_data)
+creatinine_data[, creatinine := as.double(value)]
+creatinine_data[, field_id := NULL]
+creatinine_data[, value := NULL]
+creatinine_data
+```
+
+```{r}
+creatinine_data[, creatinine_irnt := RNOmni::RankNorm(creatinine)]
+creatinine_data
+```
+
+```{r}
+hist(creatinine_data$creatinine, breaks = 100)
+hist(creatinine_data$creatinine_irnt, breaks = 100)
+```
+
+```{r}
+setDF(creatinine_data)
+bb$upload_phenotype_set(
+  namespace = "public",
+  phenotype_set_name = "creatinine_example_with_irnt",
+  note = "Creatinine levels from UKBB_45561 field 30700, raw and IRNT",
+  data = creatinine_data,
+  value_type = c("Continuous", "Continuous"),
+  notes = c("Raw creatinine data from field 30700", "Inverse-rank-normal-transformed creatinine data"),
+  verbose = TRUE
+)
+```
+
+```{r}
+bb$get_phenotype_fields("public", "creatinine_example_with_irnt")
+```
+
+Get chronic renal failure phecode from phenotype set built in `phecodes.Rmd`
+
+```{r}
+bb$get_phenotype_fields(UKB, phenotype_set = "PHECODE_UKBB_45561", name_kw = "renal_failure")
+```
+
+
+# Get high-confidence loss-of-function variants in MANE Select transcripts
+
+```{r}
+bb$list_annotation_frames(WES)
+```
+
+```{r}
+vars <- bb$get_annotation_frame(WES, "vep_annotations_mane_select",
+                                LoF = "HC",
+                                fields = c()) # just the identifiers
+```
+
+```{r}
+vars
+```
+
+# Run the categorical phenotype
+
+```{r}
+bb$compute_regenie_gene(
+  namespace = UKB,
+  phenotype_set = "PHECODE_UKBB_45561",
+  phenotype_field_ids = 1102, # or `phenotype_field_titles = "phc_585_3_Chronic_renal_failure_CKD"`
+  covariate_namespace = UKB,
+  # Age, Sex and first 10 Principal Components across the unrelated White British subpopulation
+  covariate_phenotype_set = "WHITE_BRITISH_UNRELATED_COVARIATES",
+  phenotype_na_replacement = "remove", # Do not include participants with similar phecodes as controls
+  variant_namespace = WES,
+  variant_lists = vars,
+  output_namespace = "public",
+  output_gene_association_set = "renal_470K_WES_regenie_example",
+  output_note = "Renal phenotypes, white british unrelated covariates, HC LoF in 470K WES MANE select transcripts, gene-based testing with regenie"
+)
+```
+
+```{r}
+bb$list_gene_association_sets()
+```
+
+```{r}
+bb$get_phenotype_fields("public", gene_association_set = "renal_470K_WES_regenie_example")
+```
+
+```{r}
+bb$get_gene_association_data("public", "renal_470K_WES_regenie_example")
+```
+
+Get more information about the variants in the most significant gene:
+
+```{r}
+bb$get_annotation_frame(WES, "vep_annotations_mane_select",
+                        LoF = "HC",
+                        list_label = "ENSG00000008710")
+```
+
+
+# Run the continuous phenotype
+
+We have to run continuous and categorical phenos separately
+
+```{r}
+bb$compute_regenie_gene(
+  namespace = "public",
+  phenotype_set = "creatinine_example_with_irnt",
+  phenotype_field_titles = "creatinine_irnt",
+  covariate_namespace = UKB,
+  # Age, Sex and first 10 Principal Components across the unrelated White British subpopulation
+  covariate_phenotype_set = "WHITE_BRITISH_UNRELATED_COVARIATES",
+  variant_namespace = WES,
+  variant_lists = vars,
+  output_namespace = "public",
+  output_gene_association_set = "renal_470K_WES_regenie_example" # put it into the same set
+)
+```
+
+
+```{r}
+bb$get_phenotype_fields("public", gene_association_set = "renal_470K_WES_regenie_example")
+```
+
+```{r}
+bb$get_gene_association_data("public", "renal_470K_WES_regenie_example")
+```
+
+```{r}
+ckd_res <- bb$get_gene_association_data("public", "renal_470K_WES_regenie_example", title = "phc_585_3_Chronic_renal_failure_CKD")
+creatinine_res <- bb$get_gene_association_data("public", "renal_470K_WES_regenie_example", title = "creatinine_irnt")
+```
+
+```{r}
+qqman::qq(ckd_res$pvalue)
+```
+
+
+```{r}
+qqman::qq(creatinine_res$pvalue)
+```

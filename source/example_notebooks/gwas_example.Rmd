@@ -1,0 +1,147 @@
+---
+title: "Paradigm4 Training Notebook: Gene-based GWAS with regenie"
+output: html_document
+---
+
+PARADIGM4 INC.
+
+This file is distributed along with the Paradigm4 Enterprise SciDB 
+distribution kit and may only be used with a valid Paradigm4 contract 
+and in accord with the terms and conditions specified by that contract.
+
+Copyright (C) 2023 Paradigm4 Inc.
+All Rights Reserved.
+
+# Load libraries and connect to biobank
+
+```{r}
+library(biobank)
+library(data.table)
+```
+
+```{r}
+bb <- connect(
+  host = "127.0.0.1",
+  username = 'dgealow', # <- your username
+  password = rstudioapi::askForPassword(),
+  port = 8083,
+  protocol = "https"
+)
+```
+
+```{r}
+bb$list_namespaces()
+```
+
+```{r}
+UKB <- "UK_BIOBANK"
+WES <- "UK_BIOBANK_470K_WES_LOW_MAF"
+```
+
+# Prepare phenotypes
+
+Use creatinine phenotype set we preprocessed in `regenie_gene_example.Rmd`
+
+```{r}
+bb$get_phenotype_fields("public", "creatinine_example")
+```
+Get chronic renal failure phecode from phenotype set built in `phecodes.Rmd`
+
+```{r}
+bb$get_phenotype_fields(UKB, phenotype_set = "PHECODE_UKBB_45561", name_kw = "renal_failure")
+```
+
+# Get high-confidence loss-of-function variants in all MANE transcripts
+
+```{r}
+bb$list_annotation_frames(WES)
+```
+
+```{r}
+vars <- bb$get_annotation_frame(WES, "vep_annotations_mane",
+                                LoF = "HC",
+                                fields = c()) # just the identifiers
+```
+
+```{r}
+vars
+```
+
+Remove duplicate variants -- this isn't a gene-based analysis
+```{r}
+setDT(vars)
+vars[, list_label := NULL]
+vars <- unique(vars)
+vars
+```
+
+# Run phenos with plink
+
+Run creatinine
+
+```{r}
+bb$run_association_job(
+  namespace = "public",
+  phenotype_set = "creatinine_example_with_irnt",
+  phenotype_field_titles = "creatinine_irnt",
+  covariate_namespace = UKB,
+  covariate_phenotype_set = "WHITE_BRITISH_UNRELATED_COVARIATES",
+  variant_namespace = WES,
+  variant_list = vars,
+  output_namespace = "public",
+  output_association_set = "renal_470K_WES_plink_example",
+  method = "plink"
+)
+```
+
+
+```{r}
+bb$run_association_job(
+  namespace = UKB,
+  phenotype_set = "PHECODE_UKBB_45561",
+  phenotype_field_ids = 1102, # or `phenotype_field_titles = "phc_585_3_Chronic_renal_failure_CKD"`
+  covariate_namespace = UKB,
+  covariate_phenotype_set = "WHITE_BRITISH_UNRELATED_COVARIATES",
+  variant_namespace = WES,
+  variant_list = vars,
+  output_namespace = "public",
+  output_association_set = "renal_470K_WES_plink_example",
+  method = "plink"
+)
+```
+
+
+# Run phenos with regenie
+
+Run creatinine
+
+```{r}
+bb$run_association_job(
+  namespace = "public",
+  phenotype_set = "creatinine_example_with_irnt",
+  phenotype_field_titles = "creatinine_irnt",
+  covariate_namespace = UKB,
+  covariate_phenotype_set = "WHITE_BRITISH_UNRELATED_COVARIATES",
+  variant_namespace = WES,
+  variant_list = vars,
+  output_namespace = "public",
+  output_association_set = "renal_470K_WES_regenie_single",
+  method = "regenie"
+)
+```
+
+
+```{r}
+bb$run_association_job(
+  namespace = UKB,
+  phenotype_set = "PHECODE_UKBB_45561",
+  phenotype_field_ids = 1102, # or `phenotype_field_titles = "phc_585_3_Chronic_renal_failure_CKD"`
+  covariate_namespace = UKB,
+  covariate_phenotype_set = "WHITE_BRITISH_UNRELATED_COVARIATES",
+  variant_namespace = WES,
+  variant_list = vars,
+  output_namespace = "public",
+  output_association_set = "renal_470K_WES_regenie_single",
+  method = "regenie"
+)
+```

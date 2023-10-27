@@ -1,0 +1,107 @@
+---
+title: "P4 API: Polygenic Risk Scores"
+output: html_document
+---
+
+PARADIGM4 INC.
+
+This file is distributed along with the Paradigm4 Enterprise SciDB 
+distribution kit and may only be used with a valid Paradigm4 contract 
+and in accord with the terms and conditions specified by that contract.
+
+Copyright (C) 2010 - 2021 Paradigm4 Inc.
+All Rights Reserved.
+
+# 0. Connecting 
+```{r}
+library(biobank)
+bb <- connect(
+  host = "127.0.0.1",
+  username = 'scidbadmin',                #<<--- replace with your username
+  password = rstudioapi::askForPassword(),
+  port = 8083,
+  protocol = "https")
+bb$namespace='UK_BIOBANK'
+```
+
+# 1. The PRS Package
+
+The package is installed on scidb.mazetx.com for all users. Let us know if you need a tarball for remote installation.
+
+# 2. The Sumstas
+
+A PRS calculation needs to start with a set of scores, provided as a a data.frame. We'll use these Rivas-computed scores as an example. The scores need to contain per-variant pvalue and beta quantities
+This file is available at http://scidb.mazetx.com/example_notebooks/prs/example_assoc.csv
+```{r}
+assoc = data.table::fread('/usr/local/src/maze/example_notebooks/prs/example_assoc.csv')
+assoc
+```
+
+We need to reformat the scores like so:
+```{r}
+assoc_for_prs <- data.frame(
+  chrom = assoc$chrom,
+  pos = assoc$pos,
+  ref = assoc$ref,
+  alt = assoc$alt,
+  p_value = assoc$pvalue,
+  beta = assoc$beta,
+  stringsAsFactors = FALSE
+)
+```
+
+# 3. Sumstats Harmonization
+
+In order to calculate accurately, the `ref` and `alt` columns in the provided file should match the alleles in the namespace of interest. The `harmonize_sumstats` function can be used to ascertain the degree to which this is the case. We use the terms `ref` and `alt` strictly to mean reference and alternate allele in the specific genome assembly. Some stat sources, however, are more ambiguous. When there is ambiguity, you can use `try_flip_allele` to attempt a match with the alleles reversed. For those cases, the function will multiply the `beta` by -1.
+
+In this simple case, all of our alleles match
+```{r}
+PRS::harmonize_sumstats(bb, namespace='UK_BIOBANK', assoc_for_prs, try_flip_allele = F)
+```
+
+# 4. Calculate the Scores
+
+Get a subsample of EIDs to calculate, for example the UNRELATED_WHITE_BRITISH population.
+```{r}
+eids <- bb$get_participants('UK_BIOBANK', 'WHITE_BRITISH_UNRELATED_COVARIATES')
+eid_subset <- eids$eid
+length(eid_subset)
+```
+
+Compute scores with default methods.
+The flag `score_avg=FALSE` tells the method to return the sum.
+Note: this call performs clumping prior to scoring. See below for an example of how to turn clumping off.
+```{r}
+prs_result_sum <- PRS::compute_score(
+  bb, 
+  namespace = 'UK_BIOBANK',
+  sumstats = assoc_for_prs, sample_eid = eid_subset, score_avg = FALSE)
+```
+
+The returned result contains a list of configurations, a data.frame of per-eid scores and a data frame of variants used
+```{r}
+prs_result_sum
+```
+
+These are the resulting scores
+```{r}
+prs_result_sum$prs_score.all.profile
+```
+
+To compute without clumping, set `clumping=F` and provide an extra variant list of (optionally pre-clumped) variant loci - chrom,pos,ref,alt. In this case our variant list is the same as the sumstats frame. The argument is technically a list of dataframes. This is so that you can optionally provide multiple lists of variants.
+```{r}
+prs_result_noclump <- PRS::compute_score(bb, 
+                                         sumstats = assoc_for_prs, 
+                                         sample_eid = eid_subset, 
+                                         score_avg = FALSE, 
+                                         clumping = F, 
+                                         variants_lists = list(assoc_for_prs)
+                                         )
+```
+
+In our case, the clumped and the non-clumped result are the same as the clumping did not collapse any of the variants
+```{r}
+prs_result_noclump
+```
+
+For questions, write to us at maze_support@paradigm4.com
