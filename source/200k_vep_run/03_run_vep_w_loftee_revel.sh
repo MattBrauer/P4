@@ -2,9 +2,9 @@
 
 mkdir -p ~/staging/vep_run/output
 
-parallel ~/ensembl-vep/vep \
---input_file ~/staging/vep_run/input/UK_BIOBANK_470K_WES_LOW_MAF_vep_input_part_{} \
---fasta /home/dgealow/.vep/Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz \
+parallel ~/workspace/ensembl-vep/vep \
+--input_file ~/workspace/staging/vep_run/input/UKB_200K_WES/UKB_200K_WES_vep_input_part_{} \
+--fasta /home/jovyan/.vep/homo_sapiens/110_GRCh38/Homo_sapiens.GRCh38.dna.toplevel.fa.gz
 --assembly GRCh38 \
 --symbol \
 --max_af \
