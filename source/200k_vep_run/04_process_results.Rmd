@@ -15,15 +15,15 @@ All Rights Reserved.
 # Setup
 
 ```{r}
-library(data.table)
 library(biobank)
+library(tidyverse)
 ```
 
 ```{r}
 bb <- connect(
-  host = "127.0.0.1",
+  host = "scidb.mazetx.com",
   username = "scidbadmin",
-  password = rstudioapi::askForPassword(),
+  password = readLines("~/.scidb_pass"),
   port = 8083,
   protocol = "https"
 )
@@ -32,8 +32,101 @@ bb <- connect(
 # Prepare annotation frames and load the first part of the data
 
 ```{r}
-data <- fread("output/UK_BIOBANK_470K_WES_LOW_MAF_vep_output_part_00.tsv",
-             sep = "\t", na.strings = "-")
+numeric_cols <- c("chrom", "pos",
+                  "cDNA_pos", "cDNA_end",
+                  "CDS_pos", "CDS_end",
+                  "aa_pos", "aa_end",
+                  "am_pathogenicity")
+
+load_output_file <- function(output_file) {
+  suppressWarnings(
+    readr::read_tsv(output_file,
+                    col_types = 'cccccccccccccccccccccccccccc',
+                    skip = 51) %>% 
+      dplyr::rename(Uploaded_variation = `#Uploaded_variation`) %>%
+      dplyr::mutate(across(everything(), ~ na_if(.x, '-'))) %>%
+      dplyr::mutate(STRAND = ifelse(STRAND=='-1','-',ifelse(STRAND=='1','+',STRAND))) %>%
+      tidyr::separate_wider_delim(Uploaded_variation, delim='_', names = c("chrom", "pos", "ref_alt"),
+                                  too_few = "align_start") %>%
+      tidyr::separate_wider_delim(ref_alt, delim='/', names = c("ref", "alt"),
+                                  too_few = "align_start") %>%
+      tidyr::separate_wider_delim(Amino_acids, delim = '/', names = c("aa_ref", "aa_alt"),
+                                  too_few = "align_start") %>%
+      tidyr::separate_wider_delim(cDNA_position, delim = '-', names = c("cDNA_pos", "cDNA_end"),
+                                  too_few = "align_start") %>%
+      tidyr::separate_wider_delim(CDS_position, delim = '-', names = c("CDS_pos", "CDS_end"),
+                                  too_few = "align_start") %>%
+      tidyr::separate_wider_delim(Protein_position, delim = '-', names = c("aa_pos", "aa_end"),
+                                  too_few = "align_start") %>%
+      dplyr::mutate(across(all_of(numeric_cols), as.numeric)) %>%
+      dplyr::rename(geneid = Gene, list_label = Feature) %>%
+      dplyr::filter(if_all(starts_with("am_"), ~ !is.na(.))) %>%
+      dplyr::select(list_label, chrom, pos, ref, alt, geneid, aa_pos, aa_ref, aa_alt, starts_with("am_"))
+  )
+}
+```
+
+
+```{r}
+out_dir <- "~/staging/vep_run/output"
+
+annotation_frame_name <- "alphamissense_2023_OCT"
+note <- "AlphaMissense annotations from October 2023 for all transcripts. List label is Ensembl transcript ID."
+
+fill_annotation_frame <- function(namespace) {
+  output_files <- fs::dir_ls(fs::path(out_dir, namespace), glob = "*.tsv")
+  output <- load_output_file(output_files[[1]]) %>%
+    as.data.frame()
+  
+  field_types <- setNames(sapply(output, typeof), colnames(output))
+  field_types[field_types=="character"] <- "string"
+  field_types[field_types %in% c("double", "integer")] <- "double"
+  if(!all(field_types %in% c("string", "double"))) stop("wrong type")
+  
+  fields <- field_types %>%
+    tibble::enframe(name = "name", value = "type") %>%
+    dplyr::filter(!name %in% c("list_label","chrom","pos","ref","alt")) %>%
+    as.data.frame()
+
+  bb$delete_annotation_frame(namespace = namespace,
+                             annotation_frame = annotation_frame_name)
+  bb$create_annotation_frame(namespace = namespace,
+                             annotation_frame_name = annotation_frame_name,
+                             fields = fields,
+                             note = note)
+
+  bb$load_annotation_frame(namespace = namespace,
+                           annotation_frame = annotation_frame_name,
+                           data = as.data.frame(output))
+  
+  lapply(output_files[1:length(output_files)], function(output_file) {
+    print(output_file)
+    output <- load_output_file(output_file) %>%
+      as.data.frame()
+    bb$load_annotation_frame(namespace = namespace,
+                             annotation_frame = annotation_frame_name,
+                             data = as.data.frame(output))
+    rm(output)
+  })
+}
+
+continue_annotation_frame <- function(namespace, start_index) {
+  output_files <- fs::dir_ls(fs::path(out_dir, namespace), glob = "*.tsv")
+
+  lapply(output_files[start_index:length(output_files)], function(output_file) {
+    print(output_file)
+    output <- load_output_file(output_file) %>%
+      as.data.frame()
+    bb$load_annotation_frame(namespace = namespace,
+                             annotation_frame = annotation_frame_name,
+                             data = as.data.frame(output))
+    rm(output)
+  })
+}
+
+fill_annotation_frame("UKB_200K_WES")
+fill_annotation_frame("UK_BIOBANK_470K_WES_LOW_MAF")
+
 ```
 
 ```{r}
