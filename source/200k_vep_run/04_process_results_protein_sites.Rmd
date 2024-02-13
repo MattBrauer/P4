@@ -1,0 +1,201 @@
+---
+title: "Process VEP results, and upload to SciDB"
+output: html_document
+---
+
+PARADIGM4 INC.
+
+This file is distributed along with the Paradigm4 Enterprise SciDB 
+distribution kit and may only be used with a valid Paradigm4 contract 
+and in accord with the terms and conditions specified by that contract.
+
+Copyright (C) 2023 Paradigm4 Inc.
+All Rights Reserved.
+
+# Setup
+
+```{r}
+library(biobank)
+library(tidyverse)
+```
+
+```{r}
+bb <- connect(
+  host = "scidb.mazetx.com",
+  username = "scidbadmin",
+  password = readLines("~/.scidb_pass"),
+  port = 8083,
+  protocol = "https"
+)
+```
+
+# Prepare annotation frames and load the first part of the data
+
+```{r}
+#Uploaded_variation
+#Location
+#Allele
+#Gene
+#Feature
+#Feature_type
+#Consequence
+#cDNA_position
+#CDS_position
+#Protein_position
+#Amino_acids
+#Codons
+#Existing_variation
+#IMPACT
+#DISTANCE
+#STRAND
+#FLAGS
+#ENSP
+#SWISSPROT
+#TREMBL
+#UNIPARC
+#UNIPROT_ISOFORM
+
+
+numeric_cols <- c("chrom", "pos",
+                  "cDNA_pos", "cDNA_end",
+                  "CDS_pos", "CDS_end",
+                  "aa_pos", "aa_end")
+
+load_output_file <- function(output_file) {
+  suppressWarnings(
+    readr::read_tsv(output_file,
+                    col_types = 'cccccccccccccccccccccc',
+                    skip = 51) %>% 
+      dplyr::rename(Uploaded_variation = `#Uploaded_variation`) %>%
+      dplyr::mutate(across(everything(), ~ na_if(.x, '-'))) %>%
+      dplyr::mutate(STRAND = ifelse(STRAND=='-1','-',ifelse(STRAND=='1','+',STRAND))) %>%
+      tidyr::separate_wider_delim(Uploaded_variation, delim='_', names = c("chrom", "pos", "ref_alt"),
+                                  too_few = "align_start") %>%
+      tidyr::separate_wider_delim(ref_alt, delim='/', names = c("ref", "alt"),
+                                  too_few = "align_start") %>%
+      tidyr::separate_wider_delim(Amino_acids, delim = '/', names = c("aa_ref", "aa_alt"),
+                                  too_few = "align_start") %>%
+      tidyr::separate_wider_delim(cDNA_position, delim = '-', names = c("cDNA_pos", "cDNA_end"),
+                                  too_few = "align_start") %>%
+      tidyr::separate_wider_delim(CDS_position, delim = '-', names = c("CDS_pos", "CDS_end"),
+                                  too_few = "align_start") %>%
+      tidyr::separate_wider_delim(Protein_position, delim = '-', names = c("aa_pos", "aa_end"),
+                                  too_few = "align_start") %>%
+      dplyr::mutate(across(all_of(numeric_cols), as.numeric)) %>%
+      dplyr::rename(geneid = Gene, list_label = Feature) %>%
+      dplyr::select(-aa_end) %>%
+      dplyr::filter(if_all(starts_with("aa_"), ~ !is.na(.))) %>%
+      dplyr::select(list_label, chrom, pos, ref, alt, geneid, aa_pos, aa_ref, aa_alt)
+  )
+}
+```
+
+
+```{r}
+out_dir <- "~/staging/vep_run/output/mvp_ckd_grch37"
+
+annotation_frame_name <- "protein_sites"
+note <- "AlphaMissense annotations from October 2023 for all transcripts. List label is Ensembl transcript ID."
+
+fill_annotation_frame <- function(namespace) {
+  output_files <- fs::dir_ls(fs::path(out_dir, namespace), glob = "*.tsv")
+  output <- load_output_file(output_files[[1]]) %>%
+    as.data.frame()
+  
+  field_types <- setNames(sapply(output, typeof), colnames(output))
+  field_types[field_types=="character"] <- "string"
+  field_types[field_types %in% c("double", "integer")] <- "double"
+  if(!all(field_types %in% c("string", "double"))) stop("wrong type")
+  
+  fields <- field_types %>%
+    tibble::enframe(name = "name", value = "type") %>%
+    dplyr::filter(!name %in% c("list_label","chrom","pos","ref","alt")) %>%
+    as.data.frame()
+
+  if(annotation_frame_name %in% bb$list_annotation_frames(namespace)$annotation_frame_name)
+    bb$delete_annotation_frame(namespace = namespace,
+                               annotation_frame = annotation_frame_name)
+  
+  bb$create_annotation_frame(namespace = namespace,
+                             annotation_frame_name = annotation_frame_name,
+                             fields = fields,
+                             note = note)
+
+  bb$load_annotation_frame(namespace = namespace,
+                           annotation_frame = annotation_frame_name,
+                           data = as.data.frame(output))
+  
+  lapply(output_files[2:length(output_files)], function(output_file) {
+    print(output_file)
+    output <- load_output_file(output_file) %>%
+      as.data.frame()
+    bb$load_annotation_frame(namespace = namespace,
+                             annotation_frame = annotation_frame_name,
+                             data = as.data.frame(output))
+    rm(output)
+  })
+}
+
+continue_annotation_frame <- function(namespace, start_index) {
+  output_files <- fs::dir_ls(fs::path(out_dir, namespace), glob = "*.tsv")
+
+  lapply(output_files[start_index:length(output_files)], function(output_file) {
+    print(output_file)
+    output <- load_output_file(output_file) %>%
+      as.data.frame()
+    bb$load_annotation_frame(namespace = namespace,
+                             annotation_frame = annotation_frame_name,
+                             data = as.data.frame(output))
+    rm(output)
+  })
+}
+
+fill_annotation_frame("UKB_200K_WES")
+fill_annotation_frame("UK_BIOBANK_470K_WES_LOW_MAF")
+
+```
+
+
+# Check that uploads were successful
+
+Reconnect as user
+```{r}
+bb <- connect(
+  host = "scidb.mazetx.com",
+  username = "mbrauer",
+  password = rstudioapi::askForPassword(),
+  port = 8083,
+  protocol = "https"
+)
+```
+
+```{r}
+bb$get_annotation_frame_fields("UKB_200K_WES", "alphamissense_2023_OCT")
+bb$get_annotation_frame_fields("UK_BIOBANK_470K_WES_LOW_MAF", "alphamissense_2023_OCT")
+```
+
+```{bash}
+head input/UK_BIOBANK_470K_WES_LOW_MAF_vep_input_part_00
+```
+
+```{r}
+bb$get_annotation_frame("UK_BIOBANK_470K_WES_LOW_MAF", "alphamissense_2023_OCT",
+                        chrom = 1,
+                        start = 1000000,
+                        end = 2000000)
+```
+
+```{r}
+bb$get_annotation_frame(WES, "vep_annotations_all", list_label = "ENST00000688131")
+```
+
+```{r}
+bb$get_annotation_frame(WES, "vep_annotations_mane_select",
+                        chrom = 1,
+                        pos = 1054382)
+```
+
+```{r}
+bb$get_annotation_frame(WES, "vep_annotations_mane_select",
+                        LoF = "HC")
+```
